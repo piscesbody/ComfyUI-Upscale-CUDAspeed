@@ -1,0 +1,2 @@
+spandrel>=0.3.0
+torch>=2.0.0
