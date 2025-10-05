@@ -1,8 +1,8 @@
 # ComfyUI-Upscale-CUDAspeed
 
 ## 中文说明
-
-一个高性能的ComfyUI图像放大插件，利用CUDA加速，支持多GPU、混合精度和Tensor Core优化。
+基于官方通过模型放大图像节点优化升级。
+一个高性能的ComfyUI视频&图像放大插件，利用CUDA加速，支持多GPU、混合精度和Tensor Core优化。
 
 ### 功能特性
 
