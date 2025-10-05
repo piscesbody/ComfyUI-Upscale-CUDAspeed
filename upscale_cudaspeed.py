@@ -16,6 +16,13 @@ import math
 import time
 
 try:
+    from tqdm import tqdm
+    tqdm_available = True
+except ImportError:
+    tqdm_available = False
+    print("tqdm not available, using basic progress indicators")
+
+try:
     from spandrel_extra_arches import EXTRA_REGISTRY
     from spandrel import MAIN_REGISTRY
     MAIN_REGISTRY.add(*EXTRA_REGISTRY)
@@ -70,6 +77,22 @@ class ImageUpscaleWithModelCUDAspeed:
     CATEGORY = "image/upscaling"
 
     def upscale(self, upscale_model, image, use_autocast="enable", precision="auto", multi_gpu_mode="auto", tile_size=512, overlap=32, gpu_load_balance=0.0):
+        print(f"开始图像放大处理，输入图像尺寸: {image.shape}")
+        # 尝试获取更具体的模型名称
+        model_name = getattr(upscale_model, 'name', None)
+        if model_name is None:
+            # 尝试从模型属性中获取更多信息
+            model_name = getattr(upscale_model, '__class__', type(upscale_model)).__name__
+            # 如果是ImageModelDescriptor实例，尝试获取底层模型信息
+            if hasattr(upscale_model, 'model'):
+                underlying_model = getattr(upscale_model.model, '__class__', None)
+                if underlying_model:
+                    model_name = f"{model_name}({underlying_model.__name__})"
+            else:
+                model_name = type(upscale_model).__name__
+        print(f"使用放大模型: {model_name}, 模型缩放比例: {upscale_model.scale}")
+        print(f"使用参数 - 自动混合精度: {use_autocast}, 精度: {precision}, 多GPU模式: {multi_gpu_mode}")
+        
         # 确定精度
         if precision == "auto":
             if model_management.should_use_fp16():
@@ -86,21 +109,28 @@ class ImageUpscaleWithModelCUDAspeed:
 
         # 确定多GPU模式
         if multi_gpu_mode == "auto":
-            if torch.cuda.device_count() > 1:
+            available_gpus = torch.cuda.device_count()
+            print(f"检测到 {available_gpus} 个可用GPU")
+            if available_gpus > 1:
                 multi_gpu_mode = "dual_gpu"
             else:
                 multi_gpu_mode = "primary_only"
         
         # 根据GPU配置使用适当的放大方法
+        print(f"选择放大模式: {multi_gpu_mode}")
         if multi_gpu_mode == "dual_gpu" and torch.cuda.device_count() > 1:
-            return self.upscale_multi_gpu(upscale_model, image, use_autocast, dtype, tile_size, overlap, gpu_load_balance)
+            result = self.upscale_multi_gpu(upscale_model, image, use_autocast, dtype, tile_size, overlap, gpu_load_balance)
         else:
-            return self.upscale_single_gpu(upscale_model, image, use_autocast, dtype, tile_size, overlap)
+            result = self.upscale_single_gpu(upscale_model, image, use_autocast, dtype, tile_size, overlap)
+        print(f"图像放大处理完成，输出图像尺寸: {result[0].shape}")
+        return result
 
     def upscale_single_gpu(self, upscale_model, image, use_autocast, dtype, tile_size, overlap):
         """单GPU放大，使用混合精度和Tensor Core优化"""
         device = model_management.get_torch_device()
         upscale_model.to(device)
+
+        print(f"开始单GPU放大处理，图像尺寸: {image.shape}, 设备: {device}")
 
         # 创建CUDA流以重叠计算和内存传输
         compute_stream = torch.cuda.Stream(device)
@@ -128,7 +158,26 @@ class ImageUpscaleWithModelCUDAspeed:
                     tile_x=current_tile_size, tile_y=current_tile_size,
                     overlap=overlap
                 )
-                pbar = comfy.utils.ProgressBar(steps)
+                print(f"预计处理步骤数: {steps}, 当前瓦片大小: {current_tile_size}x{current_tile_size}")
+                
+                # 如果有tqdm则创建进度条，否则使用原有进度条
+                if tqdm_available:
+                    tqdm_pbar = tqdm(total=steps, desc="单GPU放大处理", unit="tile", leave=False)
+                    # 创建一个包装类来桥接tqdm和ComfyUI的ProgressBar
+                    class TqdmProgressBar:
+                        def __init__(self, pbar):
+                            self.pbar = pbar
+                        
+                        def update(self, value):
+                            self.pbar.update(value)
+                        
+                        def close(self):
+                            self.pbar.close()
+                    
+                    wrapped_pbar = TqdmProgressBar(tqdm_pbar)
+                    actual_pbar = wrapped_pbar
+                else:
+                    actual_pbar = comfy.utils.ProgressBar(steps)
                 
                 # 如果启用则使用自动混合精度
                 with torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_enabled else torch.no_grad():
@@ -155,66 +204,49 @@ class ImageUpscaleWithModelCUDAspeed:
                         tile_y=current_tile_size,
                         overlap=overlap,
                         upscale_amount=upscale_model.scale,
-                        pbar=pbar
+                        pbar=actual_pbar
                     )
                 
                 # 等待计算流完成
                 compute_stream.synchronize()
                 oom = False
+                
+                # 关闭进度条
+                if tqdm_available and 'tqdm_pbar' in locals():
+                    tqdm_pbar.close()
             except model_management.OOM_EXCEPTION as e:
+                if tqdm_available and 'tqdm_pbar' in locals():
+                    tqdm_pbar.close()
                 current_tile_size //= 2
+                print(f"内存不足，减小瓦片大小到 {current_tile_size}x{current_tile_size}")
                 if current_tile_size < 128:
                     raise e
 
-        # 将模型移回CPU并限制结果
-        upscale_model.to("cpu")
         # 改进输出处理以增强模型兼容性
         s = s.movedim(-3, -1)
-        # 某些模型可能输出超出[0,1]范围的值，需要适当处理
+        # 某些模型可能输出超出[0,1]范围的值或包含NaN/无穷大，需要适当处理
         # 检查是否存在非数值或极值
         s = torch.nan_to_num(s, nan=0.0, posinf=1.0, neginf=0.0)
         
-        # 检查值范围，如果模型输出值过小或为负值，需要进行适当的缩放
+        # 简化输出值范围处理
         s_min = torch.min(s)
         s_max = torch.max(s)
         
-        # 检查是否所有值都接近0（这在混合精度计算中可能发生）
-        if s_max <= 1e-6 and s_min >= -1e-6:
-            # 如果值非常小，可能是混合精度导致的精度问题
-            # 首先检查是否有非零值
-            if torch.any(torch.abs(s) > 1e-10):
-                # 如果存在非零值，进行归一化
-                range_val = s_max - s_min
-                if range_val > 1e-10:
-                    s = (s - s_min) / range_val
-                else:
-                    # 如果范围太小，直接clamp到[0,1]
-                    s = torch.clamp(s, min=0.0, max=1.0)
-            else:
-                # 如果所有值都接近0，输出全黑图像
-                s = torch.zeros_like(s)
-        # 如果值范围在0-1之间，直接clamp
-        elif s_max <= 1.0 and s_min >= 0.0:
+        # 如果值范围异常（例如全部接近0或范围过大），进行适当的归一化
+        if s_max <= 1.0 and s_min >= 0.0:
+            # 正常范围，直接限制
             s = torch.clamp(s, min=0.0, max=1.0)
-        # 如果值范围在0-255之间，说明可能是RGB值，需要除以255
-        elif s_max <= 25.0 and s_min >= 0.0:
-            s = s / 255.0
-        # 如果值范围是负的或范围异常，进行归一化，但避免全部归一化为灰色
+        elif s_max - s_min > 1e-6:
+            # 有合理范围，进行归一化到[0,1]
+            s = (s - s_min) / (s_max - s_min)
         else:
-            # 只有在范围合理的情况下才进行归一化
-            range_val = s_max - s_min
-            if range_val > 1e-6:
-                s = (s - s_min) / range_val
-            else:
-                # 如果所有值都相同且范围为0，确保不是0值
-                if s_min < 0:
-                    s = torch.zeros_like(s) # 输出黑色
-                elif s_min > 1:
-                    s = torch.ones_like(s)   # 输出白色
-                else:
-                    s = torch.clamp(s, min=0.0, max=1.0)  # 保持原值在0-1之间
+            # 所有值几乎相同，限制到[0,1]
+            s = torch.clamp(s, min=0.0, max=1.0)
         
         s = torch.clamp(s, min=0.0, max=1.0)
+        
+        # 将模型移回CPU以释放GPU内存，然后再返回结果
+        upscale_model.to("cpu")
         return (s,)
 
     def upscale_multi_gpu(self, upscale_model, image, use_autocast, dtype, tile_size, overlap, gpu_load_balance=0.0):
@@ -223,7 +255,11 @@ class ImageUpscaleWithModelCUDAspeed:
         device_secondary = torch.device("cuda:1")
         num_gpus = torch.cuda.device_count()
         
+        print(f"开始多GPU放大处理，图像尺寸: {image.shape}, 主GPU: {device_primary}, 副GPU: {device_secondary}")
+        print(f"使用参数 - 瓦片大小: {tile_size}, 重叠: {overlap}, 负载平衡: {gpu_load_balance}")
+
         if num_gpus < 2:
+            print("检测到少于2个GPU，回退到单GPU模式")
             # 如果只有一个GPU可用，则回退到单GPU模式
             return self.upscale_single_gpu(upscale_model, image, use_autocast, dtype, tile_size, overlap)
         
@@ -301,9 +337,8 @@ class ImageUpscaleWithModelCUDAspeed:
             if secondary_gpu_share == 0 and batch_size > 1:
                 secondary_gpu_share = 1
                 primary_gpu_share = batch_size - 1
-
             # 输出批次分割信息
-            print(f"Batch split: Primary GPU gets {primary_gpu_share} images, Secondary GPU gets {secondary_gpu_share} images")
+            print(f"批次分割: 主GPU处理 {primary_gpu_share} 张图像, 副GPU处理 {secondary_gpu_share} 张图像")
 
             # 创建模型副本用于副GPU，避免模型移动
             model_secondary = self._copy_model_to_device(upscale_model, device_secondary)
@@ -316,7 +351,7 @@ class ImageUpscaleWithModelCUDAspeed:
             def process_primary_images():
                 import time  # 在函数内部导入time
                 start_time = time.time()
-                print(f"Primary GPU thread started at {start_time}")
+                print(f"主GPU线程启动于 {start_time:.2f}")
                 
                 # 创建CUDA流以重叠计算和内存传输
                 primary_compute_stream = torch.cuda.Stream(device_primary)
@@ -334,8 +369,25 @@ class ImageUpscaleWithModelCUDAspeed:
                             tile_x=tile_size, tile_y=tile_size,
                             overlap=overlap
                         )
-                        pbar_primary = comfy.utils.ProgressBar(steps_primary)
-                        print(f"Primary GPU processing {img_primary.shape[0]} images, total {steps_primary} steps")
+                        print(f"主GPU处理 {img_primary.shape[0]} 张图像, 共 {steps_primary} 步骤")
+                        
+                        # 创建主GPU进度条
+                        if tqdm_available:
+                            tqdm_pbar_primary = tqdm(total=steps_primary, desc="主GPU处理", unit="tile", leave=False)
+                            class TqdmProgressBar:
+                                def __init__(self, pbar):
+                                    self.pbar = pbar
+                                
+                                def update(self, value):
+                                    self.pbar.update(value)
+                                
+                                def close(self):
+                                    self.pbar.close()
+                            
+                            wrapped_pbar_primary = TqdmProgressBar(tqdm_pbar_primary)
+                            actual_pbar_primary = wrapped_pbar_primary
+                        else:
+                            actual_pbar_primary = comfy.utils.ProgressBar(steps_primary)
                         
                         # 使用直接调用而非lambda函数，确保混合精度正确处理
                         def upscale_primary_fn(x):
@@ -356,22 +408,27 @@ class ImageUpscaleWithModelCUDAspeed:
                             tile_y=tile_size,
                             overlap=overlap,
                             upscale_amount=upscale_model.scale,
-                            pbar=pbar_primary
+                            pbar=actual_pbar_primary
                         )
                         # 等待计算流完成
                         primary_compute_stream.synchronize()
                         # 在存储前检查值范围
-                        result_primary = torch.clamp(result_primary, min=0, max=1e5)  # 限制异常大值
-                        primary_result[0] = result_primary
+                        result_primary = torch.clamp(result_primary, min=0, max=1e5) # 限制异常大值
                         
-                print(f"Primary GPU thread ended at {time.time()}")
-                
-
+                        # 尽早将结果移至CPU以释放GPU内存
+                        primary_result[0] = result_primary.cpu()
+                        
+                        # 关闭主GPU进度条
+                        if tqdm_available and 'tqdm_pbar_primary' in locals():
+                            tqdm_pbar_primary.close()
+                        
+                print(f"主GPU线程结束于 {time.time():.2f}, 耗时 {(time.time()-start_time):.2f} 秒")
+                 
             # 定义在副GPU上处理图像的函数
             def process_secondary_images():
                 import time  # 在函数内部导入time
                 start_time = time.time()
-                print(f"Secondary GPU thread started at {start_time}")
+                print(f"副GPU线程启动于 {start_time:.2f}")
                 
                 # 创建CUDA流以重叠计算和内存传输
                 secondary_compute_stream = torch.cuda.Stream(device_secondary)
@@ -389,8 +446,25 @@ class ImageUpscaleWithModelCUDAspeed:
                             tile_x=tile_size, tile_y=tile_size,
                             overlap=overlap
                         )
-                        pbar_secondary = comfy.utils.ProgressBar(steps_secondary)
-                        print(f"Secondary GPU processing {img_secondary.shape[0]} images, total {steps_secondary} steps")
+                        print(f"副GPU处理 {img_secondary.shape[0]} 张图像, 共 {steps_secondary} 步骤")
+                        
+                        # 创建副GPU进度条
+                        if tqdm_available:
+                            tqdm_pbar_secondary = tqdm(total=steps_secondary, desc="副GPU处理", unit="tile", leave=False)
+                            class TqdmProgressBar:
+                                def __init__(self, pbar):
+                                    self.pbar = pbar
+                                
+                                def update(self, value):
+                                    self.pbar.update(value)
+                                
+                                def close(self):
+                                    self.pbar.close()
+                            
+                            wrapped_pbar_secondary = TqdmProgressBar(tqdm_pbar_secondary)
+                            actual_pbar_secondary = wrapped_pbar_secondary
+                        else:
+                            actual_pbar_secondary = comfy.utils.ProgressBar(steps_secondary)
                         
                         # 使用直接调用而非lambda函数，确保混合精度正确处理
                         def upscale_secondary_fn(x):
@@ -411,35 +485,39 @@ class ImageUpscaleWithModelCUDAspeed:
                             tile_y=tile_size,
                             overlap=overlap,
                             upscale_amount=upscale_model.scale, # 使用移动模型的比例
-                            pbar=pbar_secondary
+                            pbar=actual_pbar_secondary
                         )
                         # 等待计算流完成
                         secondary_compute_stream.synchronize()
-                        # 将结果移回主GPU以进行连接
+                        # 尽早将结果移至CPU以释放GPU内存
                         # 在移动前检查值范围
-                        result_secondary = torch.clamp(result_secondary, min=0, max=1e5)  # 限制异常大值
-                        secondary_result[0] = result_secondary.to(device_primary, non_blocking=True)
-                        # 等待非阻塞传输完成
-                        torch.cuda.synchronize(device_primary)
+                        result_secondary = torch.clamp(result_secondary, min=0, max=1e5) # 限制异常大值
+                        secondary_result[0] = result_secondary.cpu()
                         
-                print(f"Secondary GPU thread ended at {time.time()}")
-                
+                        # 关闭副GPU进度条
+                        if tqdm_available and 'tqdm_pbar_secondary' in locals():
+                            tqdm_pbar_secondary.close()
+                        
+                print(f"副GPU线程结束于 {time.time():.2f}, 耗时 {(time.time()-start_time):.2f} 秒")
+                 
             
             # 并行运行两个处理函数
             import threading
-            print(f"Preparing to start two GPU processing threads at {time.time()}")
+            start_processing = time.time()
+            print(f"准备启动两个GPU处理线程于 {start_processing:.2f}")
             primary_thread = threading.Thread(target=process_primary_images)
             secondary_thread = threading.Thread(target=process_secondary_images)
             
             # 启动线程
             primary_thread.start()
             secondary_thread.start()
-            print(f"Two GPU processing threads started at {time.time()}")
+            print(f"两个GPU处理线程已启动于 {time.time():.2f}")
             
             # 等待线程完成
             primary_thread.join()
             secondary_thread.join()
-            print(f"Two GPU processing threads completed at {time.time()}")
+            end_processing = time.time()
+            print(f"两个GPU处理线程完成于 {end_processing:.2f}, 总处理耗时 {(end_processing-start_processing):.2f} 秒")
             
             # 收集结果
             results = []
@@ -462,88 +540,64 @@ class ImageUpscaleWithModelCUDAspeed:
                 s = torch.empty(
                     (total_batch, first_result.shape[1], first_result.shape[2], first_result.shape[3]),
                     dtype=first_result.dtype,
-                    device=device_primary,
+                    device=torch.device("cpu"),  # 直接在CPU上分配
                     memory_format=torch.channels_last if first_result.is_contiguous(memory_format=torch.channels_last) else torch.contiguous_format
                 )
                 
                 # 逐个复制结果到预分配的张量中
                 current_idx = 0
                 for result in results:
-                    if result.device != device_primary:
-                        result = result.to(device_primary, non_blocking=True)
-                        # 等待传输完成，确保数据已正确移动
-                        torch.cuda.synchronize(device_primary)
+                    # 结果已经在CPU上，直接复制
                     batch_size = result.shape[0]
                     s[current_idx:current_idx + batch_size] = result
                     current_idx += batch_size
             else:
-                s = results[0] if results else torch.empty(0, device=device_primary)
+                s = results[0] if results else torch.empty(0, device=torch.device("cpu"))
         else:
             # 单图像情况：在两个GPU上并行处理瓦片
-            print("DEBUG: 处理单图像并行瓦片放大")
+            print("处理单图像并行瓦片放大")
             s = self.process_single_image_parallel(upscale_model, in_img, use_autocast, autocast_dtype, tile_size, overlap, device_primary, device_secondary, gpu_load_balance)
 
-        # 将模型移回CPU
-        upscale_model.to("cpu")
-        
         # 在最终处理前将结果移至CPU以避免OOM
         if s.device != torch.device("cpu"):
             # 检查是否有足够的CPU内存来容纳结果
             try:
                 s = s.cpu()
             except Exception as e:
-                print(f"Failed to move result to CPU: {e}")
+                print(f"移动结果到CPU失败: {e}")
                 # 如果无法移至CPU，则保持在GPU上但限制大小
                 s = torch.clamp(s.movedim(-3, -1), min=0, max=1.0)
+                # 将模型移回CPU以释放GPU内存
+                upscale_model.to("cpu")
                 return (s,)
-        
+         
+        print(f"图像放大处理完成，最终尺寸: {s.shape}")
+
         # 改进输出处理以增强模型兼容性
         s = s.movedim(-3, -1)
-        # 某些模型可能输出超出[0,1]范围的值，需要适当处理
+        # 某些模型可能输出超出[0,1]范围的值或包含NaN/无穷大，需要适当处理
         # 检查是否存在非数值或极值
         s = torch.nan_to_num(s, nan=0.0, posinf=1.0, neginf=0.0)
         
-        # 检查值范围，如果模型输出值过小或为负值，需要进行适当的缩放
+        # 简化输出值范围处理
         s_min = torch.min(s)
         s_max = torch.max(s)
         
-        # 检查是否所有值都接近0（这在混合精度计算中可能发生）
-        if s_max <= 1e-6 and s_min >= -1e-6:
-            # 如果值非常小，可能是混合精度导致的精度问题
-            # 首先检查是否有非零值
-            if torch.any(torch.abs(s) > 1e-10):
-                # 如果存在非零值，进行归一化
-                range_val = s_max - s_min
-                if range_val > 1e-10:
-                    s = (s - s_min) / range_val
-                else:
-                    # 如果范围太小，直接clamp到[0,1]
-                    s = torch.clamp(s, min=0.0, max=1.0)
-            else:
-                # 如果所有值都接近0，输出全黑图像
-                s = torch.zeros_like(s)
-        # 如果值范围在0-1之间，直接clamp
-        elif s_max <= 1.0 and s_min >= 0.0:
+        # 如果值范围异常（例如全部接近0或范围过大），进行适当的归一化
+        if s_max <= 1.0 and s_min >= 0.0:
+            # 正常范围，直接限制
             s = torch.clamp(s, min=0.0, max=1.0)
-        # 如果值范围在0-255之间，说明可能是RGB值，需要除以255
-        elif s_max <= 25.0 and s_min >= 0.0:
-            s = s / 255.0
-        # 如果值范围是负的或范围异常，进行归一化，但避免全部归一化为灰色
+        elif s_max - s_min > 1e-6:
+            # 有合理范围，进行归一化到[0,1]
+            s = (s - s_min) / (s_max - s_min)
         else:
-            # 只有在范围合理的情况下才进行归一化
-            range_val = s_max - s_min
-            if range_val > 1e-6:
-                s = (s - s_min) / range_val
-            else:
-                # 如果所有值都相同且范围为0，确保不是0值
-                if s_min < 0:
-                    s = torch.zeros_like(s) # 输出黑色
-                elif s_min > 1:
-                    s = torch.ones_like(s)   # 输出白色
-                else:
-                    s = torch.clamp(s, min=0.0, max=1.0)  # 保持原值在0-1之间
+            # 所有值几乎相同，限制到[0,1]
+            s = torch.clamp(s, min=0.0, max=1.0)
         
         s = torch.clamp(s, min=0.0, max=1.0)
+        
+        # 将模型移回CPU以释放GPU内存
+        upscale_model.to("cpu")
         return (s,)
 
     def process_single_image_parallel(self, upscale_model, image, use_autocast, autocast_dtype, tile_size, overlap, device_primary, device_secondary, gpu_load_balance=0.0):
@@ -552,8 +606,8 @@ class ImageUpscaleWithModelCUDAspeed:
         import threading
         start_time = time.time()
         
-        print(f"Starting parallel tile upscaling, image shape: {image.shape}")
-        print(f"Tile size: {tile_size}, overlap: {overlap}")
+        print(f"开始并行瓦片放大处理，图像尺寸: {image.shape}")
+        print(f"瓦片大小: {tile_size}, 重叠: {overlap}")
         
         height, width = image.shape[-2], image.shape[-1]
         scale_factor = upscale_model.scale
@@ -564,13 +618,13 @@ class ImageUpscaleWithModelCUDAspeed:
             for x in range(0, width, tile_size - overlap):
                 tile_positions.append((y, min(y + tile_size, height), x, min(x + tile_size, width)))
         
-        print(f"Total tiles to process: {len(tile_positions)}")
-        print(f"Image dimensions: {height}x{width}, scale factor: {scale_factor}")
+        print(f"需要处理的瓦片总数: {len(tile_positions)}")
+        print(f"图像尺寸: {height}x{width}, 放大倍数: {scale_factor}")
         
         # 准备结果张量
         result = torch.zeros(
-            (image.shape[0], image.shape[1], int(height * scale_factor), int(width * scale_factor)), 
-            dtype=image.dtype, 
+            (image.shape[0], image.shape[1], int(height * scale_factor), int(width * scale_factor)),
+            dtype=image.dtype,
             device=device_primary
         )
         
@@ -578,7 +632,7 @@ class ImageUpscaleWithModelCUDAspeed:
         primary_tiles = tile_positions[::2] # 偶数索引瓦片分配给主GPU
         secondary_tiles = tile_positions[1::2]  # 奇数索引瓦片分配给副GPU
 
-        print(f"Tile allocation - Primary GPU: {len(primary_tiles)} tiles, Secondary GPU: {len(secondary_tiles)} tiles")
+        print(f"瓦片分配 - 主GPU: {len(primary_tiles)} 个瓦片, 副GPU: {len(secondary_tiles)} 个瓦片")
         
         # 创建模型的副本用于每个GPU，以实现真正的并行处理
         model_primary = self._copy_model_to_device(upscale_model, device_primary)
@@ -590,17 +644,22 @@ class ImageUpscaleWithModelCUDAspeed:
         
         # 函数处理主GPU上的瓦片
         def process_primary_tiles():
-            import time  # 在函数内部导入time
+            import time # 在函数内部导入time
             start_gpu_time = time.time()
-            print(f"Primary GPU tile thread started at {start_gpu_time}")
+            print(f"主GPU瓦片线程启动于 {start_gpu_time:.2f}")
             model_primary.to(device_primary) # 确保模型副本在主GPU上
             
             # 创建CUDA流以重叠计算和内存传输
             primary_tile_stream = torch.cuda.Stream(device_primary)
             
+            # 创建主GPU瓦片进度条
+            if tqdm_available:
+                tqdm_pbar_primary = tqdm(total=len(primary_tiles), desc="主GPU瓦片处理", unit="tile", leave=False)
+            else:
+                print(f"主GPU需处理 {len(primary_tiles)} 个瓦片")
+            
             for i, (y1, y2, x1, x2) in enumerate(primary_tiles):
                 tile_start_time = time.time()
-                print(f"Primary GPU processing tile {i+1}/{len(primary_tiles)}: ({y1},{y2},{x1},{x2}) at {tile_start_time}")
                 tile = image[:, :, y1:y2, x1:x2].to(device_primary, non_blocking=True)
                 
                 with torch.autocast(device_type="cuda", dtype=autocast_dtype) if use_autocast else torch.no_grad():
@@ -626,23 +685,41 @@ class ImageUpscaleWithModelCUDAspeed:
                 upscaled_tile = torch.clamp(upscaled_tile, min=0, max=1e5)
                 # 存储结果
                 results_primary[(ry1, ry2, rx1, rx2)] = upscaled_tile
+                
+                # 更新进度条
+                if tqdm_available:
+                    tqdm_pbar_primary.update(1)
+                elif (i + 1) % max(1, len(primary_tiles) // 10) == 0 or i == 0:
+                    print(f"主GPU处理进度: {i+1}/{len(primary_tiles)} 个瓦片 ({(i+1)/len(primary_tiles)*100:.1f}%)")
+                    
                 tile_end_time = time.time()
-                print(f"Primary GPU completed tile: ({y1},{y2},{x1},{x2}) -> ({ry1},{y2},{rx1},{rx2}) at {tile_end_time}, elapsed: {tile_end_time - tile_start_time:.2f}s")
-            print(f"Primary GPU thread ended at {time.time()}")
-        
+                # 只在调试模式下输出每个瓦片的详细信息
+                # print(f"主GPU完成瓦片: ({y1},{y2},{x1},{x2}) -> ({ry1},{y2},{rx1},{rx2}) 用时: {tile_end_time - tile_start_time:.2f}秒")
+            
+            # 关闭主GPU进度条
+            if tqdm_available:
+                tqdm_pbar_primary.close()
+                
+            print(f"主GPU瓦片线程结束于 {time.time():.2f}, 耗时 {(time.time()-start_gpu_time):.2f} 秒")
+         
         # 函数处理副GPU上的瓦片
         def process_secondary_tiles():
             import time # 在函数内部导入time
             start_gpu_time = time.time()
-            print(f"Secondary GPU tile thread started at {start_gpu_time}")
+            print(f"副GPU瓦片线程启动于 {start_gpu_time:.2f}")
             model_secondary.to(device_secondary)  # 确保模型副本在副GPU上
             
             # 创建CUDA流以重叠计算和内存传输
             secondary_tile_stream = torch.cuda.Stream(device_secondary)
             
+            # 创建副GPU瓦片进度条
+            if tqdm_available:
+                tqdm_pbar_secondary = tqdm(total=len(secondary_tiles), desc="副GPU瓦片处理", unit="tile", leave=False)
+            else:
+                print(f"副GPU需处理 {len(secondary_tiles)} 个瓦片")
+            
             for i, (y1, y2, x1, x2) in enumerate(secondary_tiles):
                 tile_start_time = time.time()
-                print(f"Secondary GPU processing tile {i+1}/{len(secondary_tiles)}: ({y1},{y2},{x1},{x2}) at {tile_start_time}")
                 tile = image[:, :, y1:y2, x1:x2].to(device_secondary, non_blocking=True)
                 
                 with torch.autocast(device_type="cuda", dtype=autocast_dtype) if use_autocast else torch.no_grad():
@@ -664,53 +741,67 @@ class ImageUpscaleWithModelCUDAspeed:
                 ry1, ry2 = int(y1 * scale_factor), int(y2 * scale_factor)
                 rx1, rx2 = int(x1 * scale_factor), int(x2 * scale_factor)
                 
+                # 尽早将结果移至CPU以释放GPU内存
                 # 存储结果前先限制值范围，避免异常值
                 upscaled_tile = torch.clamp(upscaled_tile, min=0, max=1e5)
-                # 将结果移回主GPU以保持一致性，使用非阻塞传输
-                results_secondary[(ry1, ry2, rx1, rx2)] = upscaled_tile.to(device_primary, non_blocking=True)
-                # 等待非阻塞传输完成
-                torch.cuda.synchronize(device_primary)
+                results_secondary[(ry1, ry2, rx1, rx2)] = upscaled_tile.cpu()
+                
+                # 更新进度条
+                if tqdm_available:
+                    tqdm_pbar_secondary.update(1)
+                elif (i + 1) % max(1, len(secondary_tiles) // 10) == 0 or i == 0:
+                    print(f"副GPU处理进度: {i+1}/{len(secondary_tiles)} 个瓦片 ({(i+1)/len(secondary_tiles)*100:.1f}%)")
+                    
                 tile_end_time = time.time()
-                print(f"Secondary GPU completed tile: ({y1},{y2},{x1},{x2}) -> ({ry1},{y2},{rx1},{rx2}) at {tile_end_time}, elapsed: {tile_end_time - tile_start_time:.2f}s")
-            print(f"Secondary GPU thread ended at {time.time()}")
-        
+                # 只在调试模式下输出每个瓦片的详细信息
+                # print(f"副GPU完成瓦片: ({y1},{y2},{x1},{x2}) -> ({ry1},{y2},{rx1},{rx2}) 用时: {tile_end_time - tile_start_time:.2f}秒")
+            
+            # 关闭副GPU进度条
+            if tqdm_available:
+                tqdm_pbar_secondary.close()
+                
+            print(f"副GPU瓦片线程结束于 {time.time():.2f}, 耗时 {(time.time()-start_gpu_time):.2f} 秒")
+         
         # 并行运行两个函数
-        print(f"Preparing to start two GPU tile threads at {time.time()}")
+        print(f"准备启动两个GPU瓦片线程于 {time.time():.2f}")
         thread_primary = threading.Thread(target=process_primary_tiles)
         thread_secondary = threading.Thread(target=process_secondary_tiles)
         
         # 启动线程
         thread_primary.start()
         thread_secondary.start()
-        print(f"Two GPU tile threads started at {time.time()}")
+        print(f"两个GPU瓦片线程已启动于 {time.time():.2f}")
         
         # 等待两个线程完成
         thread_primary.join()
         thread_secondary.join()
-        print(f"Two GPU tile threads completed at {time.time()}")
+        print(f"两个GPU瓦片线程完成于 {time.time():.2f}")
         
-        # 合并结果 - 主GPU结果
+        # 将主GPU的瓦片结果从CPU移回GPU以进行合并操作
+        print("开始合并瓦片结果...")
         for (ry1, ry2, rx1, rx2), tile_result in results_primary.items():
-            # 确保tile_result在正确的设备上
-            if tile_result.device != device_primary:
-                tile_result = tile_result.to(device_primary)
-            result[:, :, ry1:ry2, rx1:rx2] = tile_result
+            # 将CPU上的瓦片结果移至GPU以进行合并
+            tile_result_gpu = tile_result.to(device_primary, non_blocking=True)
+            # 等待传输完成
+            torch.cuda.synchronize(device_primary)
+            result[:, :, ry1:ry2, rx1:rx2] = tile_result_gpu
         
-        # 合并结果 - 副GPU结果
+        # 将结果从CPU移回GPU以进行合并操作
         for (ry1, ry2, rx1, rx2), tile_result in results_secondary.items():
-            # 确保tile_result在正确的设备上
-            if tile_result.device != device_primary:
-                tile_result = tile_result.to(device_primary)
+            # 将CPU上的瓦片结果移至GPU以进行合并
+            tile_result_gpu = tile_result.to(device_primary, non_blocking=True)
+            # 等待传输完成
+            torch.cuda.synchronize(device_primary)
             # 处理重叠区域，通过在重叠区域取平均值
             current = result[:, :, ry1:ry2, rx1:rx2]
-            new_val = tile_result
+            new_val = tile_result_gpu
             
             # 对重叠区域进行简单平均
             combined = (current + new_val) / 2.0
             result[:, :, ry1:ry2, rx1:rx2] = combined
             
         end_time = time.time()
-        print(f"Parallel tile upscaling completed, total time {end_time - start_time:.2f}s")
+        print(f"并行瓦片放大完成, 总耗时 {end_time - start_time:.2f} 秒")
         return result
 
     def _copy_model_to_device(self, original_model, device):
