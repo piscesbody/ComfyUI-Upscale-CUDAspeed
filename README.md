@@ -11,6 +11,8 @@
      - `overlap`: 8（视频放大无所谓，最小值即可）
      - `enable_compile`: 启用（编译第一次运行需要30秒左右的时间，但是速度提升80%，批量处理建议开启。）
      - `optimization_level`: 优化级别speed
+<img width="429" height="358" alt="image" src="https://github.com/user-attachments/assets/fc74de34-5333-4bd8-b1d6-9c413deb7d21" />
+
 
 目前无法解决编译时长问题，ai写的代码，deepseek，GPT-5，claude轮番上阵，认知不够无法解决。望大佬指点。
 
