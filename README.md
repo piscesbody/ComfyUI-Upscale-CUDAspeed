@@ -1,6 +1,7 @@
 # ComfyUI-Upscale-CUDAspeed
 
 一个高性能的ComfyUI图像放大插件，通过CUDA加速和模型编译优化提供极致的放大速度。
+<img width="649" height="438" alt="image" src="https://github.com/user-attachments/assets/37597f8a-f5f2-4932-a3a7-59c6c17fc17e" />
 
 ## 特性
 
