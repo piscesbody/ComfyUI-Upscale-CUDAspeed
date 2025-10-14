@@ -1,6 +1,6 @@
 """
-ComfyUI Upscale CUDAspeed - 高性能图像放大节点
-实现多GPU支持、自动混合精度和Tensor Core优化
+ComfyUI Upscale CUDAspeed
+优化编译后长时间处理和尺寸变化重新编译的问题
 """
 
 import logging
@@ -14,6 +14,10 @@ import folder_paths
 from typing import Optional, Tuple, List
 import math
 import time
+import gc
+import os
+import pickle
+import hashlib
 
 try:
     from tqdm import tqdm
@@ -52,8 +56,10 @@ class UpscaleModelLoader:
         return (out, )
 
 
-class ImageUpscaleWithModelCUDAspeed:
-    """高性能放大节点，支持多GPU、自动混合精度和Tensor Core优化"""
+class ImageUpscaleWithModelCUDAspeedFixed:
+    """高性能放大节点
+    优化编译后长时间处理和尺寸变化重新编译的问题
+    """
     
     @classmethod
     def INPUT_TYPES(s):
@@ -63,140 +69,473 @@ class ImageUpscaleWithModelCUDAspeed:
                 "image": ("IMAGE",),
                 "use_autocast": (["enable", "disable"], {"default": "enable"}),
                 "precision": (["auto", "fp16", "fp32", "bf16"], {"default": "auto"}),
-                "multi_gpu_mode": (["auto", "primary_only", "dual_gpu"], {"default": "auto"}),
-                "tile_size": ("INT", {"default": 512, "min": 128, "max": 2048, "step": 64}),
-                "overlap": ("INT", {"default": 32, "min": 8, "max": 128, "step": 8}),
+                "tile_size": ("INT", {"default": 0, "min": 0, "max": 2048, "step": 64}),
+                "overlap": ("INT", {"default": 0, "min": 0, "max": 128, "step": 8}),
+                "enable_compile": (["enable", "disable"], {"default": "enable"}),
+                "optimization_level": (["balanced", "speed", "memory"], {"default": "balanced"}),
             },
             "optional": {
-                "gpu_load_balance": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "display": "slider"}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 16, "step": 1}),
             }
         }
 
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "upscale"
     CATEGORY = "image/upscaling"
+    
+    # 编译后的模型缓存（类变量，在实例间共享）
+    _compiled_models = {}
+    
+    # 编译模型存储目录（用于记录编译状态）
+    _compiled_models_dir = None
+    
+    # 运行时编译缓存（类变量，在实例间共享）
+    _runtime_compiled_models = {}
+    
+    # 尺寸编译缓存 - 关键修复：为不同尺寸缓存编译结果
+    _size_compiled_models = {}
+    
+    def __init__(self):
+        """初始化模型存储目录"""
+        # 设置编译模型存储目录
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        self._compiled_models_dir = os.path.join(current_dir, "compiled_models")
+        os.makedirs(self._compiled_models_dir, exist_ok=True)
+        print(f"📁 编译模型存储目录: {self._compiled_models_dir}")
+        
+        # 初始化运行时缓存（如果是第一次实例化）
+        if not hasattr(ImageUpscaleWithModelCUDAspeedFixed, '_runtime_compiled_models'):
+            ImageUpscaleWithModelCUDAspeedFixed._runtime_compiled_models = {}
+        
+        # 初始化尺寸编译缓存
+        if not hasattr(ImageUpscaleWithModelCUDAspeedFixed, '_size_compiled_models'):
+            ImageUpscaleWithModelCUDAspeedFixed._size_compiled_models = {}
+        
+        # 加载已编译模型记录
+        self._load_compiled_models_info()
+        
+        # 调试：显示运行时缓存状态
+        print(f"🔍 运行时缓存状态: {len(ImageUpscaleWithModelCUDAspeedFixed._runtime_compiled_models)} 个编译模型")
+        print(f"🔍 尺寸缓存状态: {len(ImageUpscaleWithModelCUDAspeedFixed._size_compiled_models)} 个尺寸缓存")
+    
+    def _get_model_hash(self, model_state_dict):
+        """生成模型状态字典的哈希值"""
+        # 创建一个简化的模型状态用于哈希计算
+        simplified_state = {}
+        for key, value in model_state_dict.items():
+            # 只取部分关键参数计算哈希，避免计算量过大
+            if 'weight' in key or 'bias' in key:
+                # 取前100个元素计算哈希
+                flat_value = value.flatten()
+                sample_size = min(100, len(flat_value))
+                simplified_state[key] = flat_value[:sample_size].cpu().numpy().tobytes()
+        
+        # 计算哈希
+        hash_obj = hashlib.md5()
+        for key in sorted(simplified_state.keys()):
+            hash_obj.update(simplified_state[key])
+        
+        return hash_obj.hexdigest()
+    
+    def _get_compiled_model_path(self, model_hash):
+        """获取编译模型信息文件路径"""
+        return os.path.join(self._compiled_models_dir, f"compiled_{model_hash}.pkl")
+    
+    def _load_compiled_models_info(self):
+        """加载已编译模型信息（仅记录，不加载编译函数）"""
+        print("🔍 检查已编译的模型信息...")
+        loaded_count = 0
+        
+        for filename in os.listdir(self._compiled_models_dir):
+            if filename.startswith("compiled_") and filename.endswith(".pkl"):
+                file_path = os.path.join(self._compiled_models_dir, filename)
+                try:
+                    # 只检查文件是否存在，不实际加载编译函数
+                    if os.path.getsize(file_path) > 0:
+                        # 只记录模型哈希，不加载编译函数
+                        model_hash = filename.replace("compiled_", "").replace(".pkl", "")
+                        self._compiled_models[model_hash] = True  # 标记为已编译
+                        loaded_count += 1
+                        print(f"  ✅ 发现编译模型记录: {filename}")
+                        
+                except Exception as e:
+                    print(f"  ❌ 检查编译模型失败 {filename}: {e}")
+        
+        print(f"📊 发现 {loaded_count} 个编译模型记录")
+    
+    def _save_compiled_model_info(self, model_hash):
+        """保存编译模型信息到文件（不保存实际的编译函数）"""
+        try:
+            # 不保存编译函数本身，只保存编译记录
+            compiled_data = {
+                'model_hash': model_hash,
+                'save_time': time.time(),
+                'compile_info': '模型已编译，编译函数无法序列化保存'
+            }
+            
+            file_path = self._get_compiled_model_path(model_hash)
+            with open(file_path, 'wb') as f:
+                pickle.dump(compiled_data, f)
+            
+            print(f"💾 编译模型信息已保存: {os.path.basename(file_path)}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ 保存编译模型信息失败: {e}")
+            return False
 
-    def upscale(self, upscale_model, image, use_autocast="enable", precision="auto", multi_gpu_mode="auto", tile_size=512, overlap=32, gpu_load_balance=0.0):
-        print(f"开始图像放大处理，输入图像尺寸: {image.shape}")
-        # 尝试获取更具体的模型名称
+    def upscale(self, upscale_model, image, use_autocast="enable", precision="auto",
+                tile_size=0, overlap=0, enable_compile="enable", optimization_level="balanced",
+                batch_size=1):
+        
+        print(f"🚀 开始图像放大处理")
+        print(f"📊 输入图像尺寸: {image.shape}")
+        
+        # 获取模型信息
+        model_name = self._get_model_name(upscale_model)
+        print(f"🔧 使用放大模型: {model_name}, 模型缩放比例: {upscale_model.scale}")
+        print(f"⚙️ 使用参数 - 自动混合精度: {use_autocast}, 精度: {precision}")
+        print(f"🔧 优化级别: {optimization_level}, 模型编译: {enable_compile}")
+        
+        # 详细性能监控
+        total_start_time = time.time()
+        phase_start_time = total_start_time
+        
+        # 确定精度和优化设置
+        dtype, autocast_enabled = self._determine_precision(precision, use_autocast)
+        phase_end_time = time.time()
+        print(f"⏱️ 精度设置完成 - 耗时: {phase_end_time - phase_start_time:.3f}秒")
+        phase_start_time = phase_end_time
+        
+        # 智能参数计算
+        tile_size, overlap = self._calculate_optimal_tile_size(
+            image.shape, upscale_model.scale, tile_size, overlap, optimization_level
+        )
+        phase_end_time = time.time()
+        print(f"⏱️ 参数计算完成 - 耗时: {phase_end_time - phase_start_time:.3f}秒")
+        phase_start_time = phase_end_time
+        
+        print(f"📐 优化参数 - 瓦片大小: {tile_size}, 重叠: {overlap}")
+        
+        # 执行放大处理
+        result = self._upscale_fixed(
+            upscale_model, image, dtype, autocast_enabled,
+            tile_size, overlap, enable_compile, batch_size
+        )
+        
+        # 性能统计
+        total_end_time = time.time()
+        processing_time = total_end_time - total_start_time
+        print(f"✅ 图像放大处理完成 - 总耗时: {processing_time:.2f}秒")
+        print(f"📊 输出图像尺寸: {result[0].shape}")
+        
+        return result
+
+    def _get_model_name(self, upscale_model):
+        """获取模型名称信息"""
         model_name = getattr(upscale_model, 'name', None)
         if model_name is None:
-            # 尝试从模型属性中获取更多信息
             model_name = getattr(upscale_model, '__class__', type(upscale_model)).__name__
-            # 如果是ImageModelDescriptor实例，尝试获取底层模型信息
             if hasattr(upscale_model, 'model'):
                 underlying_model = getattr(upscale_model.model, '__class__', None)
                 if underlying_model:
                     model_name = f"{model_name}({underlying_model.__name__})"
             else:
                 model_name = type(upscale_model).__name__
-        print(f"使用放大模型: {model_name}, 模型缩放比例: {upscale_model.scale}")
-        print(f"使用参数 - 自动混合精度: {use_autocast}, 精度: {precision}, 多GPU模式: {multi_gpu_mode}")
-        
-        # 确定精度
+        return model_name
+
+    def _determine_precision(self, precision, use_autocast):
+        """确定精度设置"""
         if precision == "auto":
             if model_management.should_use_fp16():
                 precision = "fp16"
             else:
                 precision = "fp32"
         
-        # 确定数据类型
         dtype = torch.float32
-        if precision == "fp16" and use_autocast == "enable":
-            dtype = torch.float16
-        elif precision == "bf16" and use_autocast == "enable":
-            dtype = torch.bfloat16
-
-        # 确定多GPU模式
-        if multi_gpu_mode == "auto":
-            available_gpus = torch.cuda.device_count()
-            print(f"检测到 {available_gpus} 个可用GPU")
-            if available_gpus > 1:
-                multi_gpu_mode = "dual_gpu"
-            else:
-                multi_gpu_mode = "primary_only"
+        autocast_enabled = False
         
-        # 根据GPU配置使用适当的放大方法
-        print(f"选择放大模式: {multi_gpu_mode}")
-        if multi_gpu_mode == "dual_gpu" and torch.cuda.device_count() > 1:
-            result = self.upscale_multi_gpu(upscale_model, image, use_autocast, dtype, tile_size, overlap, gpu_load_balance)
+        if use_autocast == "enable":
+            if precision == "fp16":
+                dtype = torch.float16
+                autocast_enabled = True
+            elif precision == "bf16":
+                dtype = torch.bfloat16
+                autocast_enabled = True
+        
+        return dtype, autocast_enabled
+
+    def _calculate_optimal_tile_size(self, image_shape, scale_factor, tile_size, overlap, optimization_level):
+        """智能计算最优瓦片大小和重叠"""
+        _, _, height, width = image_shape if len(image_shape) == 4 else (1, *image_shape[1:])
+        
+        # 如果用户指定了参数，使用用户指定的值
+        if tile_size > 0 and overlap > 0:
+            return tile_size, overlap
+        
+        # 根据优化级别计算默认值
+        if optimization_level == "speed":
+            base_tile = 512  # 优化：减小默认瓦片大小，避免过大瓦片导致性能下降
+            base_overlap = 16
+        elif optimization_level == "memory":
+            base_tile = 256   # 小瓦片，节省内存
+            base_overlap = 24
+        else:  # balanced
+            base_tile = 384
+            base_overlap = 32
+        
+        # 根据图像尺寸智能调整瓦片大小
+        max_dim = max(height, width)
+        
+        # 优化：更智能的瓦片大小计算
+        if max_dim <= 512:
+            tile_size = min(512, base_tile)
+        elif max_dim <= 1024:
+            tile_size = min(512, base_tile)  # 对于1080p以下图像，使用512瓦片
+        elif max_dim <= 1920:
+            tile_size = min(640, base_tile)  # 对于2K图像，使用640瓦片
         else:
-            result = self.upscale_single_gpu(upscale_model, image, use_autocast, dtype, tile_size, overlap)
-        print(f"图像放大处理完成，输出图像尺寸: {result[0].shape}")
+            tile_size = base_tile
+        
+        # 优化：根据实际图像尺寸进一步调整
+        # 如果图像尺寸小于瓦片大小，直接使用图像尺寸
+        if height < tile_size and width < tile_size:
+            tile_size = max(height, width)
+        
+        # 根据缩放比例调整重叠
+        overlap = max(8, base_overlap // max(1, int(scale_factor)))
+        
+        print(f"🔧 智能瓦片计算 - 图像尺寸: {width}x{height}, 计算瓦片: {tile_size}x{tile_size}, 重叠: {overlap}")
+        
+        return tile_size, overlap
+
+    def _upscale_fixed(self, upscale_model, image, dtype, autocast_enabled,
+                      tile_size, overlap, enable_compile, batch_size):
+        """修复性能问题的单GPU放大实现"""
+        device = model_management.get_torch_device()
+        print(f"💻 使用设备: {device}")
+        print(f"🔍 设备跟踪 - _upscale_fixed入口: 输入图像设备={image.device}")
+        
+        # 先将原始模型移到设备
+        upscale_model.to(device)
+        
+        # 准备编译模型 - 关键修复：使用尺寸感知的编译缓存
+        use_compiled_model = False
+        compiled_forward = None
+        
+        # 生成尺寸键用于缓存
+        size_key = f"{image.shape[2]}x{image.shape[3]}"  # 高度x宽度
+        print(f"📐 当前输入尺寸: {size_key}")
+        
+        if enable_compile == "enable" and hasattr(torch, 'compile'):
+            # 获取模型哈希作为唯一标识
+            model_hash = None
+            try:
+                if hasattr(upscale_model, 'model') and hasattr(upscale_model.model, 'state_dict'):
+                    model_state_dict = upscale_model.model.state_dict()
+                    model_hash = self._get_model_hash(model_state_dict)
+                    print(f"🔑 模型哈希: {model_hash}")
+            except Exception as e:
+                print(f"⚠️ 获取模型哈希失败: {e}")
+                model_hash = None
+            
+            # 检查是否有编译记录
+            has_compile_record = model_hash and model_hash in self._compiled_models
+            
+            # 使用尺寸感知的缓存键
+            model_key = f"{model_hash}_{size_key}" if model_hash else f"{id(upscale_model)}_{size_key}"
+            
+            # 调试：显示缓存查找状态
+            print(f"🔍 缓存查找 - 模型键: {model_key}")
+            print(f"🔍 运行时缓存中存在: {model_key in ImageUpscaleWithModelCUDAspeedFixed._runtime_compiled_models}")
+            print(f"🔍 尺寸缓存中存在: {model_key in ImageUpscaleWithModelCUDAspeedFixed._size_compiled_models}")
+            print(f"🔍 编译记录 - 模型哈希: {model_hash}, 记录存在: {has_compile_record}")
+            
+            # 关键修复：优先检查尺寸缓存
+            if model_key in ImageUpscaleWithModelCUDAspeedFixed._size_compiled_models:
+                # 使用尺寸缓存的编译模型
+                compiled_forward = ImageUpscaleWithModelCUDAspeedFixed._size_compiled_models[model_key]
+                use_compiled_model = True
+                print(f"✅ 使用已编译模型 (尺寸缓存: {size_key})")
+            elif model_key in ImageUpscaleWithModelCUDAspeedFixed._runtime_compiled_models:
+                # 使用运行时缓存的编译模型
+                compiled_forward = ImageUpscaleWithModelCUDAspeedFixed._runtime_compiled_models[model_key]
+                use_compiled_model = True
+                print(f"✅ 使用已编译模型 (运行时缓存: {size_key})")
+            else:
+                # 需要重新编译
+                if has_compile_record:
+                    print(f"🔧 重新编译模型 (已有记录，但尺寸 {size_key} 未缓存)...")
+                else:
+                    print(f"🔧 编译模型以优化性能 (尺寸: {size_key})...")
+                
+                try:
+                    # 尝试编译模型的forward方法
+                    if hasattr(upscale_model, 'model') and hasattr(upscale_model.model, 'forward'):
+                        # 使用最安全的编译配置，完全避免CUDA图问题
+                        import os
+                        os.environ["TORCHINDUCTOR_CUDAGRAPHS"] = "0"
+                        torch._inductor.config.triton.cudagraphs = False
+                        torch._inductor.config.triton.cudagraph_trees = False
+                        
+                        # 简化的编译过程 - 移除复杂的进度条
+                        print("🔄 开始模型编译... (这可能需要几秒钟)")
+                        compile_start_time = time.time()
+                        
+                        # 使用最简单的编译模式
+                        compiled_forward = torch.compile(
+                            upscale_model.model.forward,
+                            mode="default",
+                            fullgraph=False,
+                            dynamic=False  # 固定尺寸编译，性能更好
+                        )
+                        
+                        compile_end_time = time.time()
+                        compile_time = compile_end_time - compile_start_time
+                        
+                        print(f"✅ 编译完成 - 耗时: {compile_time:.2f}秒")
+                        
+                        # 关键修复：同时保存到运行时缓存和尺寸缓存
+                        ImageUpscaleWithModelCUDAspeedFixed._runtime_compiled_models[model_key] = compiled_forward
+                        ImageUpscaleWithModelCUDAspeedFixed._size_compiled_models[model_key] = compiled_forward
+                        
+                        # 保存编译记录（不保存编译函数本身）
+                        if model_hash and not has_compile_record:
+                            self._compiled_models[model_hash] = True
+                            self._save_compiled_model_info(model_hash)
+                            print("✅ 模型编译成功并已记录")
+                        else:
+                            print("✅ 模型编译成功")
+                        
+                        use_compiled_model = True
+                        
+                    else:
+                        print("⚠️ 模型结构不支持编译，使用普通模式")
+                        use_compiled_model = False
+                except Exception as e:
+                    print(f"⚠️ 模型编译失败，使用普通模式: {e}")
+                    use_compiled_model = False
+        
+        # 启用Tensor Core优化
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # 创建优化的CUDA流
+        compute_stream = torch.cuda.Stream(device)
+        data_stream = torch.cuda.Stream(device)
+        
+        # 异步数据预处理：在编译模型的同时准备输入数据
+        print("🔄 开始异步数据预处理...")
+        data_prep_start = time.time()
+        
+        # 准备输入图像（异步）
+        with torch.cuda.stream(data_stream):
+            in_img = image.movedim(-1, -3).to(device, non_blocking=True)
+        
+        data_prep_end = time.time()
+        print(f"⏱️ 数据预处理完成 - 耗时: {data_prep_end - data_prep_start:.2f}秒")
+        
+        # 内存管理
+        print("🔄 开始内存优化...")
+        memory_start = time.time()
+        self._optimize_memory_usage(upscale_model, in_img, tile_size, device)
+        memory_end = time.time()
+        print(f"⏱️ 内存优化完成 - 耗时: {memory_end - memory_start:.2f}秒")
+        
+        # 等待数据预处理完成
+        print("🔄 等待数据预处理完成...")
+        data_stream.synchronize()
+        
+        # 执行放大处理
+        try:
+            result = self._process_tiles_fixed(
+                upscale_model, compiled_forward, use_compiled_model, in_img,
+                autocast_enabled, dtype, tile_size, overlap, compute_stream,
+                data_stream, batch_size, device
+            )
+            
+            # 智能显存管理：根据显存情况决定输出设备
+            result = self._smart_memory_management(result, upscale_model, device)
+            
+        finally:
+            # 清理内存
+            upscale_model.to("cpu")
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
+        
         return result
 
-    def upscale_single_gpu(self, upscale_model, image, use_autocast, dtype, tile_size, overlap):
-        """单GPU放大，使用混合精度和Tensor Core优化"""
-        device = model_management.get_torch_device()
-        upscale_model.to(device)
-
-        print(f"开始单GPU放大处理，图像尺寸: {image.shape}, 设备: {device}")
-
-        # 创建CUDA流以重叠计算和内存传输
-        compute_stream = torch.cuda.Stream(device)
-        default_stream = torch.cuda.current_stream(device)
-
+    def _optimize_memory_usage(self, upscale_model, image, tile_size, device):
+        """优化内存使用"""
         # 计算内存需求
         memory_required = model_management.module_size(upscale_model.model)
-        memory_required += (tile_size * tile_size * 3) * image.element_size() * max(upscale_model.scale, 1.0) * 384.0
+        memory_required += (tile_size * tile_size * 3) * image.element_size() * 384.0
         memory_required += image.nelement() * image.element_size()
+        
+        # 释放内存
         model_management.free_memory(memory_required, device)
+        
+        # 预分配GPU内存池（如果可用）
+        if hasattr(torch.cuda, 'memory_allocated'):
+            current_allocated = torch.cuda.memory_allocated(device)
+            print(f"💾 GPU内存使用: {current_allocated / 1024**3:.2f} GB")
 
-        # 使用非阻塞传输将图像移至设备
-        in_img = image.movedim(-1, -3).to(device, non_blocking=True)
-
-        # 确定是否使用自动混合精度
-        autocast_enabled = use_autocast == "enable" and dtype in [torch.float16, torch.bfloat16]
-        autocast_dtype = dtype if autocast_enabled else None
-
+    def _process_tiles_fixed(self, upscale_model, compiled_forward, use_compiled_model, in_img,
+                           autocast_enabled, dtype, tile_size, overlap, compute_stream,
+                           data_stream, batch_size, device):
+        """修复的瓦片处理 - 简化流程，移除不必要的预热"""
+        print(f"🔍 设备跟踪 - _process_tiles_fixed入口: 输入图像设备={in_img.device}")
         oom = True
         current_tile_size = tile_size
-        while oom:
+        max_retries = 3
+        retry_count = 0
+        
+        while oom and retry_count < max_retries:
             try:
+                # 计算处理步骤
                 steps = in_img.shape[0] * comfy.utils.get_tiled_scale_steps(
                     in_img.shape[3], in_img.shape[2],
                     tile_x=current_tile_size, tile_y=current_tile_size,
                     overlap=overlap
                 )
-                print(f"预计处理步骤数: {steps}, 当前瓦片大小: {current_tile_size}x{current_tile_size}")
+                print(f"📈 预计处理步骤数: {steps}, 当前瓦片大小: {current_tile_size}x{current_tile_size}")
                 
-                # 如果有tqdm则创建进度条，否则使用原有进度条
-                if tqdm_available:
-                    tqdm_pbar = tqdm(total=steps, desc="单GPU放大处理", unit="tile", leave=False)
-                    # 创建一个包装类来桥接tqdm和ComfyUI的ProgressBar
-                    class TqdmProgressBar:
-                        def __init__(self, pbar):
-                            self.pbar = pbar
-                        
-                        def update(self, value):
-                            self.pbar.update(value)
-                        
-                        def close(self):
-                            self.pbar.close()
-                    
-                    wrapped_pbar = TqdmProgressBar(tqdm_pbar)
-                    actual_pbar = wrapped_pbar
-                else:
-                    actual_pbar = comfy.utils.ProgressBar(steps)
+                # 创建进度条
+                pbar = self._create_progress_bar(steps)
                 
-                # 如果启用则使用自动混合精度
-                with torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_enabled else torch.no_grad():
-                    # 启用Tensor Core优化
-                    torch.backends.cudnn.allow_tf32 = True
-                    torch.backends.cuda.matmul.allow_tf32 = True
-                    
-                    # 使用直接调用而非lambda函数，确保混合精度正确处理
-                    def upscale_fn(x):
-                        # 切换到计算流以重叠计算和内存传输
-                        with torch.cuda.stream(compute_stream):
-                            result = upscale_model(x)
-                            # 如果使用混合精度，确保输出张量是正确的数据类型
+                # 优化的放大函数 - 支持编译和普通模式
+                def upscale_fn(x):
+                    with torch.cuda.stream(compute_stream):
+                        if use_compiled_model and compiled_forward is not None:
+                            # 使用编译后的forward函数
                             if autocast_enabled:
-                                result = result.float()
-                        # 等待计算流完成，确保结果正确
-                        compute_stream.synchronize()
-                        return result
+                                with torch.autocast(device_type="cuda", dtype=dtype):
+                                    # 编译后的函数已经绑定了模型实例
+                                    result = compiled_forward(x)
+                            else:
+                                result = compiled_forward(x)
+                        else:
+                            # 使用原始模型
+                            if autocast_enabled:
+                                with torch.autocast(device_type="cuda", dtype=dtype):
+                                    result = upscale_model(x)
+                            else:
+                                result = upscale_model(x)
+                        
+                        # 确保输出数据类型正确
+                        if autocast_enabled and result.dtype != torch.float32:
+                            result = result.float()
                     
+                    compute_stream.synchronize()
+                    return result
+                
+                # 使用优化的瓦片缩放
+                print("🔄 开始tiled_scale处理...")
+                print(f"🔍 设备跟踪 - tiled_scale调用前: 输入设备={in_img.device}")
+                tiled_scale_start_time = time.time()
+                
+                # 执行实际的tiled_scale处理
+                with torch.no_grad():
                     s = comfy.utils.tiled_scale(
                         in_img,
                         upscale_fn,
@@ -204,623 +543,370 @@ class ImageUpscaleWithModelCUDAspeed:
                         tile_y=current_tile_size,
                         overlap=overlap,
                         upscale_amount=upscale_model.scale,
-                        pbar=actual_pbar
+                        output_device=device,  # 关键优化：直接输出到GPU，避免不必要的CPU传输
+                        pbar=pbar
                     )
                 
-                # 等待计算流完成
-                compute_stream.synchronize()
+                tiled_scale_end_time = time.time()
+                print(f"✅ tiled_scale处理完成 - 耗时: {tiled_scale_end_time - tiled_scale_start_time:.3f}秒")
+                print(f"🔍 设备跟踪 - tiled_scale调用后: 输出设备={s.device}")
+                
                 oom = False
                 
                 # 关闭进度条
-                if tqdm_available and 'tqdm_pbar' in locals():
-                    tqdm_pbar.close()
+                if hasattr(pbar, 'close'):
+                    pbar.close()
+                    
             except model_management.OOM_EXCEPTION as e:
-                if tqdm_available and 'tqdm_pbar' in locals():
-                    tqdm_pbar.close()
-                current_tile_size //= 2
-                print(f"内存不足，减小瓦片大小到 {current_tile_size}x{current_tile_size}")
+                retry_count += 1
+                current_tile_size = max(128, current_tile_size // 2)
+                print(f"⚠️ 内存不足，减小瓦片大小到 {current_tile_size}x{current_tile_size} (重试 {retry_count}/{max_retries})")
+                
                 if current_tile_size < 128:
                     raise e
-
-        # 改进输出处理以增强模型兼容性
-        s = s.movedim(-3, -1)
-        # 某些模型可能输出超出[0,1]范围的值或包含NaN/无穷大，需要适当处理
-        # 检查是否存在非数值或极值
-        s = torch.nan_to_num(s, nan=0.0, posinf=1.0, neginf=0.0)
         
-        # 简化输出值范围处理
-        s_min = torch.min(s)
-        s_max = torch.max(s)
+        if oom:
+            raise model_management.OOM_EXCEPTION("无法在可用内存内处理图像")
         
-        # 如果值范围异常（例如全部接近0或范围过大），进行适当的归一化
-        if s_max <= 1.0 and s_min >= 0.0:
-            # 正常范围，直接限制
-            s = torch.clamp(s, min=0.0, max=1.0)
-        elif s_max - s_min > 1e-6:
-            # 有合理范围，进行归一化到[0,1]
-            s = (s - s_min) / (s_max - s_min)
-        else:
-            # 所有值几乎相同，限制到[0,1]
-            s = torch.clamp(s, min=0.0, max=1.0)
+        # 优化：由于tiled_scale已直接输出到GPU，直接使用GPU后处理
+        print("🔍 检查输出设备状态...")
+        print(f"📊 输出张量设备: {s.device}, 形状: {s.shape}")
         
-        s = torch.clamp(s, min=0.0, max=1.0)
+        # 确保在GPU上进行后处理
+        if s.device.type != 'cuda':
+            print(f"🔄 将结果移动到GPU进行后处理 (当前设备: {s.device})")
+            s = s.to(device, non_blocking=True)
+            print(f"✅ 结果已移动到GPU: {s.device}")
         
-        # 将模型移回CPU以释放GPU内存，然后再返回结果
-        upscale_model.to("cpu")
+        # 使用GPU后处理
+        s = self._gpu_post_process(s, device)
+        
         return (s,)
 
-    def upscale_multi_gpu(self, upscale_model, image, use_autocast, dtype, tile_size, overlap, gpu_load_balance=0.0):
-        """多GPU放大实现，使用两个GPU进行处理"""
-        device_primary = torch.device("cuda:0")
-        device_secondary = torch.device("cuda:1")
-        num_gpus = torch.cuda.device_count()
-        
-        print(f"开始多GPU放大处理，图像尺寸: {image.shape}, 主GPU: {device_primary}, 副GPU: {device_secondary}")
-        print(f"使用参数 - 瓦片大小: {tile_size}, 重叠: {overlap}, 负载平衡: {gpu_load_balance}")
-
-        if num_gpus < 2:
-            print("检测到少于2个GPU，回退到单GPU模式")
-            # 如果只有一个GPU可用，则回退到单GPU模式
-            return self.upscale_single_gpu(upscale_model, image, use_autocast, dtype, tile_size, overlap)
-        
-        # 为两个GPU计算内存需求
-        memory_required = model_management.module_size(upscale_model.model)
-        memory_required += (tile_size * tile_size * 3) * image.element_size() * max(upscale_model.scale, 1.0) * 384.0
-        memory_required += image.nelement() * image.element_size()
-        model_management.free_memory(memory_required, device_primary)
-        model_management.free_memory(memory_required, device_secondary)
-
-        # 准备输入图像
-        in_img = image.movedim(-1, -3)
-        batch_size = in_img.shape[0]
-
-        # 确定是否使用自动混合精度
-        autocast_enabled = use_autocast == "enable" and dtype in [torch.float16, torch.bfloat16]
-        autocast_dtype = dtype if autocast_enabled else None
-
-        # 初始将模型移至主GPU
-        upscale_model.to(device_primary)
-
-        # 如果批次大小大于1，则在GPU间分割批次
-        if batch_size > 1:
-            # 根据性能计算每个GPU应处理的图像数量
-            if gpu_load_balance > 0.0:
-                # 使用自定义负载平衡比例
-                primary_gpu_share = int(batch_size * gpu_load_balance)
-                secondary_gpu_share = batch_size - primary_gpu_share
-            else:
-                # 自动计算基于GPU性能的负载分配
-                primary_gpu_name = torch.cuda.get_device_name(device_primary)
-                secondary_gpu_name = torch.cuda.get_device_name(device_secondary)
-                
-                # 获取GPU属性以估算性能比例
-                primary_props = torch.cuda.get_device_properties(device_primary)
-                secondary_props = torch.cuda.get_device_properties(device_secondary)
-                
-                # 基于可用GPU属性估算性能比例
-                # 使用影响性能的因素加权组合：
-                # 1. 计算能力（主要次要版本号）
-                # 2. 多处理器数量（CUDA核心数的代理）
-                # 3. 总内存大小
-                primary_compute_capability = primary_props.major * 10 + primary_props.minor
-                secondary_compute_capability = secondary_props.major * 10 + secondary_props.minor
-                
-                # 更重地加权多处理器数量，因为它是最接近CUDA核心数的代理
-                # 同时将内存大小视为上采样工作负载的重要因素
-                primary_performance_score = (
-                    primary_compute_capability * 0.2 +  # 计算能力权重（较低，因为都是Ada Lovelace架构）
-                    primary_props.multi_processor_count * 0.6 +  # 多处理器数量权重（CUDA核心数的最佳代理）
-                    (primary_props.total_memory / (1024**3)) * 0.2  # 内存大小权重（GB）
-                )
-                
-                secondary_performance_score = (
-                    secondary_compute_capability * 0.2 +
-                    secondary_props.multi_processor_count * 0.6 +
-                    (secondary_props.total_memory / (1024**3)) * 0.2
-                )
-                
-                # 规范化性能评分以获得比例
-                total_performance_score = primary_performance_score + secondary_performance_score
-                if total_performance_score > 0:
-                    primary_gpu_performance_ratio = primary_performance_score / total_performance_score
-                    secondary_gpu_performance_ratio = secondary_performance_score / total_performance_score
-                else:
-                    # 如果计算失败则回退到平均分配
-                    primary_gpu_performance_ratio = 0.5
-                    secondary_gpu_performance_ratio = 0.5
-                
-                # 计算基于性能的批次分割
-                primary_gpu_share = int(batch_size * primary_gpu_performance_ratio)
-                secondary_gpu_share = batch_size - primary_gpu_share
-            
-            # 确保两个GPU至少获得1个图像（如果可能）
-            if secondary_gpu_share == 0 and batch_size > 1:
-                secondary_gpu_share = 1
-                primary_gpu_share = batch_size - 1
-            # 输出批次分割信息
-            print(f"批次分割: 主GPU处理 {primary_gpu_share} 张图像, 副GPU处理 {secondary_gpu_share} 张图像")
-
-            # 创建模型副本用于副GPU，避免模型移动
-            model_secondary = self._copy_model_to_device(upscale_model, device_secondary)
-            
-            # 结果存储容器
-            primary_result = [None]  # 使用列表来在子线程中修改值
-            secondary_result = [None]
-            
-            # 定义在主GPU上处理图像的函数
-            def process_primary_images():
-                import time  # 在函数内部导入time
-                start_time = time.time()
-                print(f"主GPU线程启动于 {start_time:.2f}")
-                
-                # 创建CUDA流以重叠计算和内存传输
-                primary_compute_stream = torch.cuda.Stream(device_primary)
-                
-                img_primary = in_img[:primary_gpu_share].to(device_primary, non_blocking=True)
-                
-                if img_primary.shape[0] > 0:
-                    with torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_enabled else torch.no_grad():
-                        # 启用Tensor Core优化
-                        torch.backends.cudnn.allow_tf32 = True
-                        torch.backends.cuda.matmul.allow_tf32 = True
-                        
-                        steps_primary = img_primary.shape[0] * comfy.utils.get_tiled_scale_steps(
-                            img_primary.shape[3], img_primary.shape[2],
-                            tile_x=tile_size, tile_y=tile_size,
-                            overlap=overlap
-                        )
-                        print(f"主GPU处理 {img_primary.shape[0]} 张图像, 共 {steps_primary} 步骤")
-                        
-                        # 创建主GPU进度条
-                        if tqdm_available:
-                            tqdm_pbar_primary = tqdm(total=steps_primary, desc="主GPU处理", unit="tile", leave=False)
-                            class TqdmProgressBar:
-                                def __init__(self, pbar):
-                                    self.pbar = pbar
-                                
-                                def update(self, value):
-                                    self.pbar.update(value)
-                                
-                                def close(self):
-                                    self.pbar.close()
-                            
-                            wrapped_pbar_primary = TqdmProgressBar(tqdm_pbar_primary)
-                            actual_pbar_primary = wrapped_pbar_primary
-                        else:
-                            actual_pbar_primary = comfy.utils.ProgressBar(steps_primary)
-                        
-                        # 使用直接调用而非lambda函数，确保混合精度正确处理
-                        def upscale_primary_fn(x):
-                            # 切换到计算流以重叠计算和内存传输
-                            with torch.cuda.stream(primary_compute_stream):
-                                result = upscale_model(x)
-                                # 如果使用混合精度，确保输出张量是正确的数据类型
-                                if autocast_enabled:
-                                    result = result.float()
-                            # 等待计算流完成，确保结果正确
-                            primary_compute_stream.synchronize()
-                            return result
-                        
-                        result_primary = comfy.utils.tiled_scale(
-                            img_primary,
-                            upscale_primary_fn,  # 模型已在device_primary上
-                            tile_x=tile_size,
-                            tile_y=tile_size,
-                            overlap=overlap,
-                            upscale_amount=upscale_model.scale,
-                            pbar=actual_pbar_primary
-                        )
-                        # 等待计算流完成
-                        primary_compute_stream.synchronize()
-                        # 在存储前检查值范围
-                        result_primary = torch.clamp(result_primary, min=0, max=1e5) # 限制异常大值
-                        
-                        # 尽早将结果移至CPU以释放GPU内存
-                        primary_result[0] = result_primary.cpu()
-                        
-                        # 关闭主GPU进度条
-                        if tqdm_available and 'tqdm_pbar_primary' in locals():
-                            tqdm_pbar_primary.close()
-                        
-                print(f"主GPU线程结束于 {time.time():.2f}, 耗时 {(time.time()-start_time):.2f} 秒")
-                 
-            # 定义在副GPU上处理图像的函数
-            def process_secondary_images():
-                import time  # 在函数内部导入time
-                start_time = time.time()
-                print(f"副GPU线程启动于 {start_time:.2f}")
-                
-                # 创建CUDA流以重叠计算和内存传输
-                secondary_compute_stream = torch.cuda.Stream(device_secondary)
-                
-                img_secondary = in_img[primary_gpu_share:primary_gpu_share + secondary_gpu_share].to(device_secondary, non_blocking=True)
-                
-                if img_secondary.shape[0] > 0:
-                    with torch.autocast(device_type="cuda", dtype=autocast_dtype) if autocast_enabled else torch.no_grad():
-                        # 启用Tensor Core优化
-                        torch.backends.cudnn.allow_tf32 = True
-                        torch.backends.cuda.matmul.allow_tf32 = True
-                        
-                        steps_secondary = img_secondary.shape[0] * comfy.utils.get_tiled_scale_steps(
-                            img_secondary.shape[3], img_secondary.shape[2],
-                            tile_x=tile_size, tile_y=tile_size,
-                            overlap=overlap
-                        )
-                        print(f"副GPU处理 {img_secondary.shape[0]} 张图像, 共 {steps_secondary} 步骤")
-                        
-                        # 创建副GPU进度条
-                        if tqdm_available:
-                            tqdm_pbar_secondary = tqdm(total=steps_secondary, desc="副GPU处理", unit="tile", leave=False)
-                            class TqdmProgressBar:
-                                def __init__(self, pbar):
-                                    self.pbar = pbar
-                                
-                                def update(self, value):
-                                    self.pbar.update(value)
-                                
-                                def close(self):
-                                    self.pbar.close()
-                            
-                            wrapped_pbar_secondary = TqdmProgressBar(tqdm_pbar_secondary)
-                            actual_pbar_secondary = wrapped_pbar_secondary
-                        else:
-                            actual_pbar_secondary = comfy.utils.ProgressBar(steps_secondary)
-                        
-                        # 使用直接调用而非lambda函数，确保混合精度正确处理
-                        def upscale_secondary_fn(x):
-                            # 切换到计算流以重叠计算和内存传输
-                            with torch.cuda.stream(secondary_compute_stream):
-                                result = model_secondary(x)
-                                # 如果使用混合精度，确保输出张量是正确的数据类型
-                                if autocast_enabled:
-                                    result = result.float()
-                            # 等待计算流完成，确保结果正确
-                            secondary_compute_stream.synchronize()
-                            return result
-                        
-                        result_secondary = comfy.utils.tiled_scale(
-                            img_secondary,
-                            upscale_secondary_fn,  # 使用副GPU的模型副本
-                            tile_x=tile_size,
-                            tile_y=tile_size,
-                            overlap=overlap,
-                            upscale_amount=upscale_model.scale, # 使用移动模型的比例
-                            pbar=actual_pbar_secondary
-                        )
-                        # 等待计算流完成
-                        secondary_compute_stream.synchronize()
-                        # 尽早将结果移至CPU以释放GPU内存
-                        # 在移动前检查值范围
-                        result_secondary = torch.clamp(result_secondary, min=0, max=1e5) # 限制异常大值
-                        secondary_result[0] = result_secondary.cpu()
-                        
-                        # 关闭副GPU进度条
-                        if tqdm_available and 'tqdm_pbar_secondary' in locals():
-                            tqdm_pbar_secondary.close()
-                        
-                print(f"副GPU线程结束于 {time.time():.2f}, 耗时 {(time.time()-start_time):.2f} 秒")
-                 
-            
-            # 并行运行两个处理函数
-            import threading
-            start_processing = time.time()
-            print(f"准备启动两个GPU处理线程于 {start_processing:.2f}")
-            primary_thread = threading.Thread(target=process_primary_images)
-            secondary_thread = threading.Thread(target=process_secondary_images)
-            
-            # 启动线程
-            primary_thread.start()
-            secondary_thread.start()
-            print(f"两个GPU处理线程已启动于 {time.time():.2f}")
-            
-            # 等待线程完成
-            primary_thread.join()
-            secondary_thread.join()
-            end_processing = time.time()
-            print(f"两个GPU处理线程完成于 {end_processing:.2f}, 总处理耗时 {(end_processing-start_processing):.2f} 秒")
-            
-            # 收集结果
-            results = []
-            if primary_result[0] is not None:
-                results.append(primary_result[0])
-            if secondary_result[0] is not None:
-                results.append(secondary_result[0])
-            
-            # 处理完成后将模型移回主GPU
-            upscale_model.to(device_primary)
-            del model_secondary  # 删除副GPU模型副本以释放内存
-            
-            # 确保所有结果都在同一设备上再进行连接
-            # 使用更高效的内存分配策略：预分配结果张量
-            if len(results) > 1:
-                # 预计算总batch大小
-                total_batch = sum(result.shape[0] for result in results)
-                # 预分配结果张量，避免多次内存分配
-                first_result = results[0]
-                s = torch.empty(
-                    (total_batch, first_result.shape[1], first_result.shape[2], first_result.shape[3]),
-                    dtype=first_result.dtype,
-                    device=torch.device("cpu"),  # 直接在CPU上分配
-                    memory_format=torch.channels_last if first_result.is_contiguous(memory_format=torch.channels_last) else torch.contiguous_format
-                )
-                
-                # 逐个复制结果到预分配的张量中
-                current_idx = 0
-                for result in results:
-                    # 结果已经在CPU上，直接复制
-                    batch_size = result.shape[0]
-                    s[current_idx:current_idx + batch_size] = result
-                    current_idx += batch_size
-            else:
-                s = results[0] if results else torch.empty(0, device=torch.device("cpu"))
+    def _create_progress_bar(self, steps):
+        """创建进度条"""
+        if tqdm_available:
+            return tqdm(total=steps, desc="单GPU放大处理", unit="tile", leave=False)
         else:
-            # 单图像情况：在两个GPU上并行处理瓦片
-            print("处理单图像并行瓦片放大")
-            s = self.process_single_image_parallel(upscale_model, in_img, use_autocast, autocast_dtype, tile_size, overlap, device_primary, device_secondary, gpu_load_balance)
+            return comfy.utils.ProgressBar(steps)
 
-        # 在最终处理前将结果移至CPU以避免OOM
-        if s.device != torch.device("cpu"):
-            # 检查是否有足够的CPU内存来容纳结果
+    def _post_process_output(self, output_tensor):
+        """修复编译模型输出发白问题的后处理"""
+        print(f"🔧 开始增强后处理，输入设备: {output_tensor.device}")
+        print(f"🔍 设备跟踪 - _post_process_output: 输入设备={output_tensor.device}")
+        
+        # 调整维度顺序
+        s = output_tensor.movedim(-3, -1)
+        print(f"🔍 设备跟踪 - movedim后: 设备={s.device}")
+        
+        # 处理非数值
+        s = torch.nan_to_num(s, nan=0.0, posinf=1.0, neginf=0.0)
+        print(f"🔍 设备跟踪 - nan_to_num后: 设备={s.device}")
+        
+        # 详细的数值统计分析
+        s_min = torch.min(s)
+        s_max = torch.max(s)
+        s_mean = torch.mean(s)
+        s_std = torch.std(s)
+        
+        print(f"📊 原始输出统计 - 最小值: {s_min:.4f}, 最大值: {s_max:.4f}, 平均值: {s_mean:.4f}, 标准差: {s_std:.4f}")
+        
+        # 检测编译模型特有的数值范围问题
+        if s_max > 10.0 or s_min < -5.0:
+            # 严重范围偏移 - 编译模型常见问题
+            print("⚠️ 检测到严重数值范围偏移，进行深度归一化")
+            
+            # 方法1: 基于统计的归一化
+            if s_std > 0.01:  # 有合理的分布
+                # 使用3-sigma规则裁剪异常值
+                lower_bound = s_mean - 3 * s_std
+                upper_bound = s_mean + 3 * s_std
+                s = torch.clamp(s, min=lower_bound, max=upper_bound)
+                
+                # 重新计算统计量
+                s_min = torch.min(s)
+                s_max = torch.max(s)
+            
+            # 方法2: 分位数归一化（更鲁棒）
             try:
-                s = s.cpu()
-            except Exception as e:
-                print(f"移动结果到CPU失败: {e}")
-                # 如果无法移至CPU，则保持在GPU上但限制大小
-                s = torch.clamp(s.movedim(-3, -1), min=0, max=1.0)
-                # 将模型移回CPU以释放GPU内存
-                upscale_model.to("cpu")
-                return (s,)
-         
-        print(f"图像放大处理完成，最终尺寸: {s.shape}")
-
-        # 改进输出处理以增强模型兼容性
-        s = s.movedim(-3, -1)
-        # 某些模型可能输出超出[0,1]范围的值或包含NaN/无穷大，需要适当处理
-        # 检查是否存在非数值或极值
-        s = torch.nan_to_num(s, nan=0.0, posinf=1.0, neginf=0.0)
+                # 使用分位数避免极端值影响
+                q_low = torch.quantile(s, 0.01)
+                q_high = torch.quantile(s, 0.99)
+                s = torch.clamp(s, min=q_low, max=q_high)
+                
+                # 重新计算统计量
+                s_min = torch.min(s)
+                s_max = torch.max(s)
+            except:
+                pass  # 分位数计算失败时使用原有方法
+            
+            # 最终归一化到[0,1]
+            if s_max - s_min > 1e-6:
+                s = (s - s_min) / (s_max - s_min)
+            else:
+                s = torch.zeros_like(s)  # 全零情况
         
-        # 简化输出值范围处理
-        s_min = torch.min(s)
-        s_max = torch.max(s)
+        elif s_max > 1.0 or s_min < 0.0:
+            # 轻微范围偏移
+            print("⚠️ 检测到轻微数值偏移，进行裁剪归一化")
+            
+            # 限制到合理范围
+            s = torch.clamp(s, min=0.0, max=s_max)
+            
+            # 如果最大值仍然大于1，进行缩放
+            if s_max > 1.0:
+                s = s / s_max
         
-        # 如果值范围异常（例如全部接近0或范围过大），进行适当的归一化
-        if s_max <= 1.0 and s_min >= 0.0:
+        else:
             # 正常范围，直接限制
             s = torch.clamp(s, min=0.0, max=1.0)
-        elif s_max - s_min > 1e-6:
-            # 有合理范围，进行归一化到[0,1]
-            s = (s - s_min) / (s_max - s_min)
-        else:
-            # 所有值几乎相同，限制到[0,1]
-            s = torch.clamp(s, min=0.0, max=1.0)
         
+        # 最终确保在[0,1]范围内
         s = torch.clamp(s, min=0.0, max=1.0)
         
-        # 将模型移回CPU以释放GPU内存
-        upscale_model.to("cpu")
-        return (s,)
+        # 最终统计验证
+        final_min = torch.min(s)
+        final_max = torch.max(s)
+        final_mean = torch.mean(s)
+        
+        print(f"✅ 处理后统计 - 最小值: {final_min:.4f}, 最大值: {final_max:.4f}, 平均值: {final_mean:.4f}")
+        print(f"🔧 增强后处理完成，输出设备: {s.device}")
+        
+        return s
 
-    def process_single_image_parallel(self, upscale_model, image, use_autocast, autocast_dtype, tile_size, overlap, device_primary, device_secondary, gpu_load_balance=0.0):
-        """在两个GPU上并行处理单个图像的瓦片"""
-        import time  # 在函数内部导入time
-        import threading
-        start_time = time.time()
+    def _accurate_memory_assessment(self, output_tensor, device):
+        """优化的显存评估 - 基于实际张量，使用更宽松的阈值"""
+        # 使用实际张量计算显存需求
+        output_memory = output_tensor.nelement() * output_tensor.element_size()
         
-        print(f"开始并行瓦片放大处理，图像尺寸: {image.shape}")
-        print(f"瓦片大小: {tile_size}, 重叠: {overlap}")
-        
-        height, width = image.shape[-2], image.shape[-1]
-        scale_factor = upscale_model.scale
-        
-        # 计算瓦片位置
-        tile_positions = []
-        for y in range(0, height, tile_size - overlap):
-            for x in range(0, width, tile_size - overlap):
-                tile_positions.append((y, min(y + tile_size, height), x, min(x + tile_size, width)))
-        
-        print(f"需要处理的瓦片总数: {len(tile_positions)}")
-        print(f"图像尺寸: {height}x{width}, 放大倍数: {scale_factor}")
-        
-        # 准备结果张量
-        result = torch.zeros(
-            (image.shape[0], image.shape[1], int(height * scale_factor), int(width * scale_factor)),
-            dtype=image.dtype,
-            device=device_primary
-        )
-        
-        # 静态分配瓦片：奇偶分配给两个GPU
-        primary_tiles = tile_positions[::2] # 偶数索引瓦片分配给主GPU
-        secondary_tiles = tile_positions[1::2]  # 奇数索引瓦片分配给副GPU
-
-        print(f"瓦片分配 - 主GPU: {len(primary_tiles)} 个瓦片, 副GPU: {len(secondary_tiles)} 个瓦片")
-        
-        # 创建模型的副本用于每个GPU，以实现真正的并行处理
-        model_primary = self._copy_model_to_device(upscale_model, device_primary)
-        model_secondary = self._copy_model_to_device(upscale_model, device_secondary)
-        
-        # 结果存储
-        results_primary = {}
-        results_secondary = {}
-        
-        # 函数处理主GPU上的瓦片
-        def process_primary_tiles():
-            import time # 在函数内部导入time
-            start_gpu_time = time.time()
-            print(f"主GPU瓦片线程启动于 {start_gpu_time:.2f}")
-            model_primary.to(device_primary) # 确保模型副本在主GPU上
+        # 获取当前显存状态
+        if hasattr(torch.cuda, 'get_device_properties'):
+            total_memory = torch.cuda.get_device_properties(device).total_memory
+            allocated = torch.cuda.memory_allocated(device)
             
-            # 创建CUDA流以重叠计算和内存传输
-            primary_tile_stream = torch.cuda.Stream(device_primary)
+            # 计算真正的可用显存：总显存 - 已分配显存
+            actual_available_memory = total_memory - allocated
             
-            # 创建主GPU瓦片进度条
-            if tqdm_available:
-                tqdm_pbar_primary = tqdm(total=len(primary_tiles), desc="主GPU瓦片处理", unit="tile", leave=False)
+            # 优化：根据总显存大小动态调整安全余量
+            if total_memory >= 20 * 1024**3:  # 20GB以上大显存显卡
+                safety_margin = 2 * 1024**3  # 2GB
             else:
-                print(f"主GPU需处理 {len(primary_tiles)} 个瓦片")
+                safety_margin = 4 * 1024**3  # 4GB
+                
+            available_memory = actual_available_memory - safety_margin
             
-            for i, (y1, y2, x1, x2) in enumerate(primary_tiles):
-                tile_start_time = time.time()
-                tile = image[:, :, y1:y2, x1:x2].to(device_primary, non_blocking=True)
-                
-                with torch.autocast(device_type="cuda", dtype=autocast_dtype) if use_autocast else torch.no_grad():
-                    # 启用Tensor Core优化
-                    torch.backends.cudnn.allow_tf32 = True
-                    torch.backends.cuda.matmul.allow_tf32 = True
-                    
-                    # 切换到计算流以重叠计算和内存传输
-                    with torch.cuda.stream(primary_tile_stream):
-                        upscaled_tile = model_primary(tile)
-                        # 如果使用混合精度，确保输出张量是正确的数据类型
-                        if use_autocast:
-                            upscaled_tile = upscaled_tile.float()  # 确保结果是float32类型
-                
-                # 等待计算流完成
-                primary_tile_stream.synchronize()
-                
-                # 计算结果位置
-                ry1, ry2 = int(y1 * scale_factor), int(y2 * scale_factor)
-                rx1, rx2 = int(x1 * scale_factor), int(x2 * scale_factor)
-                
-                # 存储结果前先限制值范围，避免异常值
-                upscaled_tile = torch.clamp(upscaled_tile, min=0, max=1e5)
-                # 存储结果
-                results_primary[(ry1, ry2, rx1, rx2)] = upscaled_tile
-                
-                # 更新进度条
-                if tqdm_available:
-                    tqdm_pbar_primary.update(1)
-                elif (i + 1) % max(1, len(primary_tiles) // 10) == 0 or i == 0:
-                    print(f"主GPU处理进度: {i+1}/{len(primary_tiles)} 个瓦片 ({(i+1)/len(primary_tiles)*100:.1f}%)")
-                    
-                tile_end_time = time.time()
-                # 只在调试模式下输出每个瓦片的详细信息
-                # print(f"主GPU完成瓦片: ({y1},{y2},{x1},{x2}) -> ({ry1},{y2},{rx1},{rx2}) 用时: {tile_end_time - tile_start_time:.2f}秒")
+            print(f"💾 优化显存评估 - 输出张量形状: {output_tensor.shape}")
+            print(f"💾 优化显存评估 - 元素数量: {output_tensor.nelement()}")
+            print(f"💾 优化显存评估 - 元素大小: {output_tensor.element_size()} 字节")
+            print(f"💾 优化显存评估 - 总显存: {total_memory/1024**3:.2f}GB")
+            print(f"💾 优化显存评估 - 已分配: {allocated/1024**3:.2f}GB")
+            print(f"💾 优化显存评估 - 实际可用: {actual_available_memory/1024**3:.2f}GB")
+            print(f"💾 优化显存评估 - 安全余量后可用: {available_memory/1024**3:.2f}GB")
+            print(f"💾 优化显存评估 - 输出需求: {output_memory/1024**3:.2f}GB")
             
-            # 关闭主GPU进度条
-            if tqdm_available:
-                tqdm_pbar_primary.close()
-                
-            print(f"主GPU瓦片线程结束于 {time.time():.2f}, 耗时 {(time.time()-start_gpu_time):.2f} 秒")
-         
-        # 函数处理副GPU上的瓦片
-        def process_secondary_tiles():
-            import time # 在函数内部导入time
-            start_gpu_time = time.time()
-            print(f"副GPU瓦片线程启动于 {start_gpu_time:.2f}")
-            model_secondary.to(device_secondary)  # 确保模型副本在副GPU上
+            # 优化：使用更宽松的检查条件
+            # 条件1：可用显存足够容纳输出张量
+            # 条件2：输出张量不超过总显存的60%
+            memory_condition = available_memory >= output_memory
+            threshold_condition = output_memory <= total_memory * 0.6
             
-            # 创建CUDA流以重叠计算和内存传输
-            secondary_tile_stream = torch.cuda.Stream(device_secondary)
+            result = memory_condition and threshold_condition
             
-            # 创建副GPU瓦片进度条
-            if tqdm_available:
-                tqdm_pbar_secondary = tqdm(total=len(secondary_tiles), desc="副GPU瓦片处理", unit="tile", leave=False)
+            if result:
+                print("✅ 显存评估通过，可以使用GPU处理")
             else:
-                print(f"副GPU需处理 {len(secondary_tiles)} 个瓦片")
-            
-            for i, (y1, y2, x1, x2) in enumerate(secondary_tiles):
-                tile_start_time = time.time()
-                tile = image[:, :, y1:y2, x1:x2].to(device_secondary, non_blocking=True)
+                print("❌ 显存评估未通过，使用CPU处理")
                 
-                with torch.autocast(device_type="cuda", dtype=autocast_dtype) if use_autocast else torch.no_grad():
-                    # 启用Tensor Core优化
-                    torch.backends.cudnn.allow_tf32 = True
-                    torch.backends.cuda.matmul.allow_tf32 = True
+            return result
+            
+        return False
+
+    def _ensure_gpu_processing(self, tensor, device):
+        """确保张量在GPU上处理"""
+        if tensor.device.type != 'cuda':
+            print(f"🔄 将张量从 {tensor.device} 移动到 GPU")
+            return tensor.to(device, non_blocking=True)
+        return tensor
+
+    def _gpu_post_process(self, output_tensor, device):
+        """GPU上的后处理"""
+        print(f"🔧 开始GPU增强后处理，输入设备: {output_tensor.device}")
+        
+        # 确保输入在GPU上
+        output_tensor = self._ensure_gpu_processing(output_tensor, device)
+        
+        # 调整维度顺序
+        s = output_tensor.movedim(-3, -1)
+        print(f"🔍 设备跟踪 - GPU movedim后: 设备={s.device}")
+        
+        # 处理非数值
+        s = torch.nan_to_num(s, nan=0.0, posinf=1.0, neginf=0.0)
+        print(f"🔍 设备跟踪 - GPU nan_to_num后: 设备={s.device}")
+        
+        # 详细的数值统计分析
+        s_min = torch.min(s)
+        s_max = torch.max(s)
+        s_mean = torch.mean(s)
+        s_std = torch.std(s)
+        
+        print(f"📊 GPU原始输出统计 - 最小值: {s_min:.4f}, 最大值: {s_max:.4f}, 平均值: {s_mean:.4f}, 标准差: {s_std:.4f}")
+        
+        # 检测编译模型特有的数值范围问题
+        if s_max > 10.0 or s_min < -5.0:
+            # 严重范围偏移 - 编译模型常见问题
+            print("⚠️ GPU检测到严重数值范围偏移，进行深度归一化")
+            
+            # 方法1: 基于统计的归一化
+            if s_std > 0.01:  # 有合理的分布
+                # 使用3-sigma规则裁剪异常值
+                lower_bound = s_mean - 3 * s_std
+                upper_bound = s_mean + 3 * s_std
+                s = torch.clamp(s, min=lower_bound, max=upper_bound)
+                
+                # 重新计算统计量
+                s_min = torch.min(s)
+                s_max = torch.max(s)
+            
+            # 方法2: 分位数归一化（更鲁棒）
+            try:
+                # 使用分位数避免极端值影响
+                q_low = torch.quantile(s, 0.01)
+                q_high = torch.quantile(s, 0.99)
+                s = torch.clamp(s, min=q_low, max=q_high)
+                
+                # 重新计算统计量
+                s_min = torch.min(s)
+                s_max = torch.max(s)
+            except:
+                pass  # 分位数计算失败时使用原有方法
+            
+            # 最终归一化到[0,1]
+            if s_max - s_min > 1e-6:
+                s = (s - s_min) / (s_max - s_min)
+            else:
+                s = torch.zeros_like(s)  # 全零情况
+        
+        elif s_max > 1.0 or s_min < 0.0:
+            # 轻微范围偏移
+            print("⚠️ GPU检测到轻微数值偏移，进行裁剪归一化")
+            
+            # 限制到合理范围
+            s = torch.clamp(s, min=0.0, max=s_max)
+            
+            # 如果最大值仍然大于1，进行缩放
+            if s_max > 1.0:
+                s = s / s_max
+        
+        else:
+            # 正常范围，直接限制
+            s = torch.clamp(s, min=0.0, max=1.0)
+        
+        # 最终确保在[0,1]范围内
+        s = torch.clamp(s, min=0.0, max=1.0)
+        
+        # 最终统计验证
+        final_min = torch.min(s)
+        final_max = torch.max(s)
+        final_mean = torch.mean(s)
+        
+        print(f"✅ GPU处理后统计 - 最小值: {final_min:.4f}, 最大值: {final_max:.4f}, 平均值: {final_mean:.4f}")
+        print(f"🔧 GPU增强后处理完成，输出设备: {s.device}")
+        
+        return s
+
+    def _smart_memory_management(self, result, upscale_model, device):
+        """智能显存管理：根据显存情况决定输出设备"""
+        print("🔍 开始智能显存管理检查...")
+        print(f"🔍 设备跟踪 - _smart_memory_management入口: 输入设备={result[0].device if result else 'None'}")
+        
+        if result is None or len(result) == 0:
+            print("❓ 结果为空，跳过显存管理")
+            return result
+            
+        output_tensor = result[0]
+        print(f"📊 输出张量设备: {output_tensor.device}, 形状: {output_tensor.shape}")
+        
+        if output_tensor.device.type != 'cuda':
+            print(f"📋 输出张量已在 {output_tensor.device}，跳过显存管理")
+            return result
+        
+        try:
+            # 计算输出张量的显存需求
+            output_memory = output_tensor.nelement() * output_tensor.element_size()
+            print(f"📊 输出张量显存需求: {output_memory/1024**3:.2f}GB")
+            
+            # 获取当前GPU显存状态
+            if hasattr(torch.cuda, 'memory_reserved'):
+                reserved = torch.cuda.memory_reserved(device)
+                allocated = torch.cuda.memory_allocated(device)
+                
+                # 获取总显存和可用显存
+                if hasattr(torch.cuda, 'get_device_properties'):
+                    total_memory = torch.cuda.get_device_properties(device).total_memory
+                    # 计算真正的可用显存：总显存 - 已分配显存
+                    actual_available_memory = total_memory - allocated
                     
-                    # 切换到计算流以重叠计算和内存传输
-                    with torch.cuda.stream(secondary_tile_stream):
-                        upscaled_tile = model_secondary(tile)
-                        # 如果使用混合精度，确保输出张量是正确的数据类型
-                        if use_autocast:
-                            upscaled_tile = upscaled_tile.float()  # 确保结果是float32类型
-                
-                # 等待计算流完成
-                secondary_tile_stream.synchronize()
-                
-                # 计算结果位置
-                ry1, ry2 = int(y1 * scale_factor), int(y2 * scale_factor)
-                rx1, rx2 = int(x1 * scale_factor), int(x2 * scale_factor)
-                
-                # 尽早将结果移至CPU以释放GPU内存
-                # 存储结果前先限制值范围，避免异常值
-                upscaled_tile = torch.clamp(upscaled_tile, min=0, max=1e5)
-                results_secondary[(ry1, ry2, rx1, rx2)] = upscaled_tile.cpu()
-                
-                # 更新进度条
-                if tqdm_available:
-                    tqdm_pbar_secondary.update(1)
-                elif (i + 1) % max(1, len(secondary_tiles) // 10) == 0 or i == 0:
-                    print(f"副GPU处理进度: {i+1}/{len(secondary_tiles)} 个瓦片 ({(i+1)/len(secondary_tiles)*100:.1f}%)")
+                    # 安全余量：保留2GB的显存用于后续操作
+                    safety_margin = 2 * 1024**3  # 2GB
+                    available_memory = actual_available_memory - safety_margin
                     
-                tile_end_time = time.time()
-                # 只在调试模式下输出每个瓦片的详细信息
-                # print(f"副GPU完成瓦片: ({y1},{y2},{x1},{x2}) -> ({ry1},{y2},{rx1},{rx2}) 用时: {tile_end_time - tile_start_time:.2f}秒")
-            
-            # 关闭副GPU进度条
-            if tqdm_available:
-                tqdm_pbar_secondary.close()
+                    print(f"💾 显存状态 - 总显存: {total_memory/1024**3:.2f}GB, 已分配: {allocated/1024**3:.2f}GB")
+                    print(f"💾 可用显存计算 - 实际可用: {actual_available_memory/1024**3:.2f}GB, 安全余量后: {available_memory/1024**3:.2f}GB")
+                    print(f"📊 输出张量需求: {output_memory/1024**3:.2f}GB")
+                    
+                    # 如果可用显存足够，直接保留在GPU上
+                    if available_memory >= output_memory:
+                        print("🚀 显存充足，结果保留在GPU直接导出")
+                        return result
+                    else:
+                        print("💾 显存不足，结果移动到CPU导出")
+                        # 异步移动到CPU，减少阻塞时间
+                        with torch.cuda.stream(torch.cuda.Stream(device)):
+                            cpu_tensor = output_tensor.cpu()
+                        print("✅ 结果已移动到CPU")
+                        return (cpu_tensor,)
+                else:
+                    # 如果没有获取总显存功能，使用旧的逻辑
+                    free_memory = reserved - allocated
+                    safety_margin = reserved * 0.2
+                    available_memory = free_memory - safety_margin
+                    
+                    print(f"💾 显存状态 (旧方法) - 已分配: {allocated/1024**3:.2f}GB, 保留: {reserved/1024**3:.2f}GB, 可用: {available_memory/1024**3:.2f}GB")
+                    
+                    if available_memory >= output_memory:
+                        print("🚀 显存充足，结果保留在GPU直接导出")
+                        return result
+                    else:
+                        print("💾 显存不足，结果移动到CPU导出")
+                        with torch.cuda.stream(torch.cuda.Stream(device)):
+                            cpu_tensor = output_tensor.cpu()
+                        print("✅ 结果已移动到CPU")
+                        return (cpu_tensor,)
+            else:
+                # 如果没有显存查询功能，保守策略：移动到CPU
+                print("💾 无法获取显存信息，结果移动到CPU导出")
+                with torch.cuda.stream(torch.cuda.Stream(device)):
+                    cpu_tensor = output_tensor.cpu()
+                return (cpu_tensor,)
                 
-            print(f"副GPU瓦片线程结束于 {time.time():.2f}, 耗时 {(time.time()-start_gpu_time):.2f} 秒")
-         
-        # 并行运行两个函数
-        print(f"准备启动两个GPU瓦片线程于 {time.time():.2f}")
-        thread_primary = threading.Thread(target=process_primary_tiles)
-        thread_secondary = threading.Thread(target=process_secondary_tiles)
-        
-        # 启动线程
-        thread_primary.start()
-        thread_secondary.start()
-        print(f"两个GPU瓦片线程已启动于 {time.time():.2f}")
-        
-        # 等待两个线程完成
-        thread_primary.join()
-        thread_secondary.join()
-        print(f"两个GPU瓦片线程完成于 {time.time():.2f}")
-        
-        # 将主GPU的瓦片结果从CPU移回GPU以进行合并操作
-        print("开始合并瓦片结果...")
-        for (ry1, ry2, rx1, rx2), tile_result in results_primary.items():
-            # 将CPU上的瓦片结果移至GPU以进行合并
-            tile_result_gpu = tile_result.to(device_primary, non_blocking=True)
-            # 等待传输完成
-            torch.cuda.synchronize(device_primary)
-            result[:, :, ry1:ry2, rx1:rx2] = tile_result_gpu
-        
-        # 将结果从CPU移回GPU以进行合并操作
-        for (ry1, ry2, rx1, rx2), tile_result in results_secondary.items():
-            # 将CPU上的瓦片结果移至GPU以进行合并
-            tile_result_gpu = tile_result.to(device_primary, non_blocking=True)
-            # 等待传输完成
-            torch.cuda.synchronize(device_primary)
-            # 处理重叠区域，通过在重叠区域取平均值
-            current = result[:, :, ry1:ry2, rx1:rx2]
-            new_val = tile_result_gpu
-            
-            # 对重叠区域进行简单平均
-            combined = (current + new_val) / 2.0
-            result[:, :, ry1:ry2, rx1:rx2] = combined
-            
-        end_time = time.time()
-        print(f"并行瓦片放大完成, 总耗时 {end_time - start_time:.2f} 秒")
-        return result
+        except Exception as e:
+            print(f"⚠️ 显存管理异常，使用保守策略: {e}")
+            # 异常情况下使用保守策略
+            with torch.cuda.stream(torch.cuda.Stream(device)):
+                cpu_tensor = output_tensor.cpu()
+            return (cpu_tensor,)
 
-    def _copy_model_to_device(self, original_model, device):
-        """创建模型的副本并将其移动到指定设备"""
-        import copy
-        import torch
-        
-        # 创建模型的深层副本
-        model_copy = copy.deepcopy(original_model)
-        # 将副本移动到目标设备
-        model_copy.to(device)
-        return model_copy
+    @classmethod
+    def IS_CHANGED(s, **kwargs):
+        return float("NaN")
 
 
+# 节点映射
 NODE_CLASS_MAPPINGS = {
     "UpscaleModelLoader": UpscaleModelLoader,
-    "ImageUpscaleWithModelCUDAspeed": ImageUpscaleWithModelCUDAspeed
+    "ImageUpscaleWithModelCUDAspeedFixed": ImageUpscaleWithModelCUDAspeedFixed
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ImageUpscaleWithModelCUDAspeed": "Upscale Image CUDAspeed (Multi-GPU & Mixed Precision)",
+    "ImageUpscaleWithModelCUDAspeedFixed": "🚀 Upscale Image CUDAspeed",
 }
